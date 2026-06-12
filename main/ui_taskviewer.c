@@ -159,6 +159,7 @@ static lv_obj_t   *s_timer_popup_arc       = NULL;
 static lv_obj_t   *s_timer_popup_lbl       = NULL;   /* mm:ss or "Stopp" */
 static lv_obj_t   *s_timer_popup_pause_lbl = NULL;   /* pause/play button label */
 static lv_timer_t *s_timer_popup_lv_timer  = NULL;   /* 250 ms update tick */
+static lv_obj_t   *s_busy_popup            = NULL;   /* "already running" notice */
 
 /* ── Forward declarations ── */
 static void refresh_task(void);
@@ -1315,8 +1316,9 @@ static void cb_timer_btn_tick(lv_timer_t *t) {
     if (!ts->active && !ts->paused) return;
     if (ts->task_idx != ui_current || ts->user_idx != active_user) return;
     uint32_t rem = timer_engine_remaining_sec();
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+    char buf[20];
+    snprintf(buf, sizeof(buf), LV_SYMBOL_BELL " %02u:%02u",
+             (unsigned)(rem / 60), (unsigned)(rem % 60));
     lv_label_set_text(lbl_btn_timer, buf);
 }
 
@@ -1385,10 +1387,11 @@ static void show_timer_popup(void) {
     lv_obj_clear_flag(s_timer_popup, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(s_timer_popup, cb_timer_popup_close, LV_EVENT_CLICKED, NULL);
 
-    /* Modal card */
+    /* Modal card — pad_all=0 so positions below are exact card-relative px */
     lv_obj_t *card = lv_obj_create(s_timer_popup);
-    lv_obj_set_size(card, 280, 320);
+    lv_obj_set_size(card, 300, 360);
     lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
     lv_obj_set_style_bg_color(card, th_bg(), 0);
     lv_obj_set_style_radius(card, 20, 0);
     lv_obj_set_style_border_width(card, 0, 0);
@@ -1397,24 +1400,27 @@ static void show_timer_popup(void) {
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(card, cb_timer_card_click, LV_EVENT_CLICKED, NULL);
 
-    /* Depleting arc (full circle, orange indicator, gray background) */
+    /* Depleting arc — full circle, orange indicator depletes as time passes.
+     * Card width=300, arc=210: left/right padding = (300-210)/2 = 45 px. */
     lv_obj_t *arc = lv_arc_create(card);
-    lv_obj_set_size(arc, 200, 200);
-    lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_set_size(arc, 210, 210);
+    lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 22);
     lv_arc_set_rotation(arc, 270);
     lv_arc_set_bg_angles(arc, 0, 360);
     lv_arc_set_range(arc, 0, (int32_t)ts->duration_sec);
     lv_arc_set_value(arc, (int32_t)rem);
     lv_obj_set_style_arc_color(arc, C_ACCENT, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(arc, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arc, 12, LV_PART_INDICATOR);
     lv_obj_set_style_arc_color(arc, th_track(), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 12, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_border_width(arc, 0, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
     lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
     s_timer_popup_arc = arc;
 
-    /* Centre label overlaid on arc: "mm:ss" while running, "Stopp" when expired */
+    /* Centre label overlaid on arc: "mm:ss" while running, "Stopp" when expired.
+     * Arc top=22, height=210, centre=22+105=127. Font ui_48 ~56px tall → top=127-28=99. */
     lv_obj_t *lbl = lv_label_create(card);
     if (expired) {
         lv_label_set_text(lbl, "Stopp");
@@ -1425,16 +1431,17 @@ static void show_timer_popup(void) {
     }
     lv_obj_set_style_text_font(lbl, &lv_font_ui_48, 0);
     lv_obj_set_style_text_color(lbl, th_fg(), 0);
-    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 100);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 99);
     s_timer_popup_lbl = lbl;
 
-    /* Button row */
-    int btn_row_y = 258;
+    /* Button row at y=262.  Card=300, two btns: (300-124)/2=88 left margin.
+     * Single btn (expired): (300-52)/2=124 left margin. */
+    int btn_y = 262;
     if (!expired) {
-        /* Pause / play button */
         lv_obj_t *btn_pause = lv_btn_create(card);
         lv_obj_set_size(btn_pause, 52, 52);
-        lv_obj_set_pos(btn_pause, 70, btn_row_y);
+        lv_obj_set_pos(btn_pause, 88, btn_y);
+        lv_obj_set_style_pad_all(btn_pause, 0, 0);
         lv_obj_set_style_bg_color(btn_pause, th_fg(), 0);
         lv_obj_set_style_radius(btn_pause, 26, 0);
         lv_obj_set_style_shadow_width(btn_pause, 0, 0);
@@ -1447,11 +1454,11 @@ static void show_timer_popup(void) {
         s_timer_popup_pause_lbl = pl;
     }
 
-    /* Restart button */
-    int restart_x = expired ? 114 : 158;
+    int restart_x = expired ? 124 : 160;  /* centred or right-of-pause */
     lv_obj_t *btn_restart = lv_btn_create(card);
     lv_obj_set_size(btn_restart, 52, 52);
-    lv_obj_set_pos(btn_restart, restart_x, btn_row_y);
+    lv_obj_set_pos(btn_restart, restart_x, btn_y);
+    lv_obj_set_style_pad_all(btn_restart, 0, 0);
     lv_obj_set_style_bg_color(btn_restart, th_fg(), 0);
     lv_obj_set_style_radius(btn_restart, 26, 0);
     lv_obj_set_style_shadow_width(btn_restart, 0, 0);
@@ -1466,32 +1473,36 @@ static void show_timer_popup(void) {
     s_timer_popup_lv_timer = lv_timer_create(cb_timer_popup_tick, 250, NULL);
 }
 
-/* Show "already running" blocking notice */
+/* "Already running" toast — auto-dismisses after 3 s, no click handler.
+ * Using a static pointer prevents double-create and the use-after-free crash
+ * that a click handler + pending lv_timer would otherwise cause. */
 static void cb_busy_popup_autodismiss(lv_timer_t *t) {
-    lv_obj_t *overlay = (lv_obj_t *)lv_timer_get_user_data(t);
-    lv_timer_del(t);
-    if (overlay) lv_obj_del(overlay);
-}
-
-static void cb_busy_popup_close(lv_event_t *e) {
-    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
-    if (overlay) lv_obj_del(overlay);
+    (void)t;  /* lv_timer_set_repeat_count(1) auto-deletes t after this returns */
+    if (s_busy_popup) {
+        lv_obj_del(s_busy_popup);
+        s_busy_popup = NULL;
+    }
 }
 
 static void show_timer_busy_popup(void) {
-    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(overlay);
-    lv_obj_set_size(overlay, SCREEN_W, SCREEN_H);
-    lv_obj_set_pos(overlay, 0, 0);
-    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(overlay, LV_OPA_40, 0);
-    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(overlay, cb_busy_popup_close, LV_EVENT_CLICKED, overlay);
+    /* Dismiss any previous instance before creating a new one */
+    if (s_busy_popup) {
+        lv_obj_del(s_busy_popup);
+        s_busy_popup = NULL;
+    }
 
-    lv_obj_t *card = lv_obj_create(overlay);
-    lv_obj_set_size(card, 320, 110);
+    s_busy_popup = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_busy_popup);
+    lv_obj_set_size(s_busy_popup, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_busy_popup, 0, 0);
+    lv_obj_set_style_bg_color(s_busy_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_busy_popup, LV_OPA_40, 0);
+    lv_obj_clear_flag(s_busy_popup, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *card = lv_obj_create(s_busy_popup);
+    lv_obj_set_size(card, 300, 100);
     lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
     lv_obj_set_style_bg_color(card, th_bg(), 0);
     lv_obj_set_style_radius(card, 16, 0);
     lv_obj_set_style_border_width(card, 0, 0);
@@ -1501,14 +1512,14 @@ static void show_timer_busy_popup(void) {
     lv_obj_t *lbl = lv_label_create(card);
     lv_label_set_text(lbl, "En timer k\xC3\xB6rs\nredan i bakgrunden");
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lbl, 280);
+    lv_obj_set_width(lbl, 260);
     lv_obj_set_style_text_font(lbl, &lv_font_ui_14, 0);
     lv_obj_set_style_text_color(lbl, th_fg(), 0);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
 
-    lv_timer_t *t = lv_timer_create(cb_busy_popup_autodismiss, 3000, overlay);
-    lv_timer_set_repeat_count(t, 1);
+    lv_timer_t *tmr = lv_timer_create(cb_busy_popup_autodismiss, 3000, NULL);
+    lv_timer_set_repeat_count(tmr, 1);
 }
 
 static void cb_timer_btn(lv_event_t *e) {
@@ -1639,15 +1650,16 @@ static void refresh_task(void) {
                           ts->task_idx == ui_current && ts->user_idx == active_user;
         if (timer_here) {
             uint32_t rem = timer_engine_remaining_sec();
-            char buf[8];
-            snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+            char buf[20];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BELL " %02u:%02u",
+                     (unsigned)(rem / 60), (unsigned)(rem % 60));
             lv_label_set_text(lbl_btn_timer, buf);
             lv_obj_set_style_bg_color(btn_timer,
                                       ts->paused ? th_muted() : C_ACCENT, 0);
         } else {
             uint32_t min = (t->timer_duration_sec + 59) / 60;
-            char buf[12];
-            snprintf(buf, sizeof(buf), "%d min", (int)min);
+            char buf[20];
+            snprintf(buf, sizeof(buf), LV_SYMBOL_BELL " %d min", (int)min);
             lv_label_set_text(lbl_btn_timer, buf);
             lv_obj_set_style_bg_color(btn_timer, C_ACCENT, 0);
         }
@@ -2575,7 +2587,7 @@ void ui_build(void) {
     lbl_btn_timer = lv_label_create(btn_timer);
     lv_label_set_text(lbl_btn_timer, "");
     lv_obj_set_style_text_color(lbl_btn_timer, C_WHITE, 0);
-    lv_obj_set_style_text_font(lbl_btn_timer, &lv_font_ui_14, 0);
+    lv_obj_set_style_text_font(lbl_btn_timer, icon_font_sm(), 0);  /* montserrat: has symbols */
     lv_obj_center(lbl_btn_timer);
 
     /* Register expiry callback — fires in LVGL context via lv_async_call */
