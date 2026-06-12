@@ -52,6 +52,11 @@ static void power_button_task(void *arg) {
     }
 }
 
+void power_button_force_wake(void) {
+    display_on = true;
+    set_lcd_blight(100);
+}
+
 void power_button_init(void) {
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << POWER_BTN_GPIO,

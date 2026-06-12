@@ -20,6 +20,7 @@
 #include "user_store.h"
 #include "bsp_illuminate.h"
 #include "timer_engine.h"
+#include "power_button.h"
 
 
 static const char *TAG = "UI";
@@ -1549,6 +1550,18 @@ static void cb_timer_btn(lv_event_t *e) {
 static void on_timer_expired(void *arg) {
     (void)arg;
     const timer_state_t *ts = timer_engine_get_state();
+
+    /* Wake display if it was sleeping — we hold the LVGL lock here so delete
+     * sleep_overlay directly instead of calling ui_wake_display() which would
+     * try to re-acquire the already-held lock. */
+    if (display_sleeping) {
+        if (sleep_overlay) {
+            lv_obj_del(sleep_overlay);
+            sleep_overlay = NULL;
+        }
+        display_sleeping = false;
+        power_button_force_wake();  /* turns on backlight, syncs power button state */
+    }
 
     /* Switch user if timer was running for a different user */
     if (ts->user_idx != active_user && ts->user_idx < user_count) {
