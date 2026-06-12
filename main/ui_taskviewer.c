@@ -9,6 +9,9 @@
 #include "ui_taskviewer.h"
 #include "calendar_fetch.h"
 #include "streak_store.h"
+#include "lang.h"
+#include "challenge_store.h"
+#include "img_gold_medal.h"
 #include "sound_driver.h"
 #include "ws2812_led.h"
 #include "lvgl.h"
@@ -85,7 +88,9 @@ static bool ui_showing_keyboard = false;
 static bool ui_showing_settings = false;
 
 /* ── User bar — one button per user across the top of the right panel ── */
-static lv_obj_t *user_bar_btns[MAX_USERS] = {0};
+static lv_obj_t *user_bar_btns[MAX_USERS]       = {0};
+static lv_obj_t *user_bar_medal_imgs[MAX_USERS] = {0};
+static lv_obj_t *user_bar_medal_lbls[MAX_USERS] = {0};
 
 /* ── Settings state ── */
 static lv_obj_t *settings_overlay = NULL;
@@ -124,13 +129,16 @@ static kb_submit_fn kb_on_submit = NULL;
 /* ── UI elements ── */
 static lv_obj_t *lbl_greeting, *lbl_date;
 static lv_obj_t *lbl_streak_num, *lbl_streak_label;
-static lv_obj_t *lbl_level_name, *lbl_level_next;
+static lv_obj_t *lbl_level_name, *lbl_level_days, *lbl_level_next;
 static lv_obj_t *arc_progress, *lbl_arc_num, *lbl_arc_total;
 static lv_obj_t *bar_xp;
 static lv_obj_t *lbl_task_counter, *lbl_task_time, *lbl_task_title;
 static lv_obj_t *badge_completed;
+static lv_obj_t *img_challenge_medal_sm = NULL;   /* 32×32 medal icon on task card */
+static lv_obj_t *lbl_challenge_progress = NULL;   /* "3/8" or "×2 5/8" */
 static lv_obj_t *btn_complete, *lbl_btn_complete;
 static lv_obj_t *dots_container;
+static lv_obj_t *lbl_volume_icon = NULL;
 static lv_obj_t *s_mp = NULL;
 static lv_obj_t *lbl_clock = NULL;
 static lv_obj_t *lbl_dark_btn = NULL;
@@ -146,6 +154,8 @@ static void refresh_progress(void);
 static void refresh_dots(void);
 static void refresh_sidebar(void);
 static void show_complete_screen(void);
+static void user_bar_refresh(void);
+static void show_leaderboard(void);
 static void hide_complete_screen(void);
 static void cb_clock_tick(lv_timer_t *t);
 
@@ -166,6 +176,16 @@ static void cb_complete(lv_event_t *e) {
     bool was = cal_tasks[ui_current].completed;
     cal_tasks[ui_current].completed = !was;
     calendar_sync_completion_cache();
+
+    /* Challenge series tracking */
+    cal_task_t *t = &cal_tasks[ui_current];
+    if (t->challenge_target > 0) {
+        if (!was) {
+            challenge_complete(t->challenge_series, t->challenge_target);
+        } else {
+            challenge_uncomplete(t->challenge_series);
+        }
+    }
 
     ui_completed = calendar_get_completed();
 
@@ -189,6 +209,7 @@ static void cb_complete(lv_event_t *e) {
     refresh_progress();
     refresh_dots();
     refresh_sidebar();
+    if (t->challenge_target > 0) user_bar_refresh();
 }
 
 static void cb_next(lv_event_t *e) {
@@ -248,6 +269,66 @@ static void cb_wake_display(lv_event_t *e) {
     calendar_request_refresh();
 }
 
+/* ── Volume popup ── */
+static void cb_volume_slider(lv_event_t *e) {
+    lv_obj_t *slider = lv_event_get_target(e);
+    int val = (int)lv_slider_get_value(slider);
+    sound_set_volume(val);
+    if (lbl_volume_icon) {
+        const char *sym = (val == 0)  ? LV_SYMBOL_MUTE :
+                          (val < 50)  ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_VOLUME_MAX;
+        lv_label_set_text(lbl_volume_icon, sym);
+    }
+}
+
+static void cb_volume_overlay_close(lv_event_t *e) {
+    lv_obj_t *overlay = lv_event_get_target(e);
+    lv_obj_del(overlay);
+}
+
+static void cb_volume_btn(lv_event_t *e) {
+    (void)e;
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_40, 0);
+    lv_obj_add_event_cb(overlay, cb_volume_overlay_close, LV_EVENT_CLICKED, NULL);
+
+    /* Modal card — stays clickable so touches on it don't reach the overlay */
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 340, 110);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, th_card(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, TR_VOLUME);
+    lv_obj_set_style_text_color(title, th_fg(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_ui_14, 0);
+    lv_obj_set_pos(title, 24, 16);
+
+    lv_obj_t *slider = lv_slider_create(card);
+    lv_obj_set_size(slider, 292, 8);
+    lv_obj_set_pos(slider, 24, 56);
+    lv_slider_set_range(slider, 0, 100);
+    lv_slider_set_value(slider, sound_get_volume(), LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(slider, th_track(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, C_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, C_ACCENT, LV_PART_KNOB);
+    lv_obj_set_style_radius(slider, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(slider, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(slider, 12, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(slider, 8, LV_PART_KNOB);
+    lv_obj_add_event_cb(slider, cb_volume_slider, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
 static void cb_sleep_display(lv_event_t *e) {
     (void)e;
     if (display_sleeping) return;
@@ -291,7 +372,7 @@ static const char *kb_rows_num[] = {
 static void kb_update_display(void) {
     if (!kb_lbl_input) return;
     if (kb_input_len == 0) {
-        lv_label_set_text(kb_lbl_input, "Task name...");
+        lv_label_set_text(kb_lbl_input, TR_TASK_NAME_PLACEHOLDER);
         lv_obj_set_style_text_color(kb_lbl_input, C_MUTED, 0);
     } else {
         lv_label_set_text(kb_lbl_input, kb_input);
@@ -333,8 +414,8 @@ static void kb_add_local_task(void) {
         ct->completed = false;
         cal_task_count++;
 
-        /* If we were showing "No events" placeholder, remove it */
-        if (cal_task_count == 2 && strcmp(cal_tasks[0].title, "No events") == 0) {
+        /* If we were showing "Inga uppgifter" placeholder, remove it */
+        if (cal_task_count == 2 && strcmp(cal_tasks[0].title, "Inga uppgifter") == 0) {
             cal_tasks[0] = cal_tasks[1];
             cal_task_count = 1;
         }
@@ -633,11 +714,16 @@ static void cb_settings_remove_user(lv_event_t *e) {
         active_user = (idx == 0) ? 1 : 0;
         calendar_sources_load_user(active_user);
         streak_set_active_user(active_user);
+        challenge_set_active_user(active_user);
         calendar_suppress_next_completion_save();
         calendar_fetch();
         ui_refresh_all();
     }
     user_store_remove(idx);
+    streak_shift_down(idx, user_count);      /* keep streak NVS indices in sync */
+    challenge_shift_down(idx, user_count);   /* keep challenge NVS indices in sync */
+    streak_set_active_user(active_user);     /* re-sync in-memory state to new indices */
+    challenge_set_active_user(active_user);
     user_store_save();
     settings_populate_user_list();
 }
@@ -833,7 +919,7 @@ static void settings_rebuild_source_list(void) {
         if (src->url[0]) {
             snprintf(sub_text, sizeof(sub_text), "%s - %.38s", type_str, src->url);
         } else {
-            snprintf(sub_text, sizeof(sub_text), "%s - Add URL via phone", type_str);
+            snprintf(sub_text, sizeof(sub_text), TR_ADD_URL_VIA_PHONE_FMT, type_str);
         }
         lv_label_set_text(sub_lbl, sub_text);
         lv_obj_set_style_text_color(sub_lbl, th_muted(), 0);
@@ -906,9 +992,9 @@ static void settings_rebuild_source_list(void) {
     const char *ip = web_config_get_ip();
     char hint_buf[160];
     if (ip[0]) {
-        snprintf(hint_buf, sizeof(hint_buf), "Edit on your phone: http://%s/", ip);
+        snprintf(hint_buf, sizeof(hint_buf), TR_EDIT_ON_PHONE_FMT, ip);
     } else {
-        snprintf(hint_buf, sizeof(hint_buf), "Connect WiFi to enable phone config.");
+        snprintf(hint_buf, sizeof(hint_buf), TR_CONNECT_WIFI);
     }
     lv_label_set_text(hint, hint_buf);
     lv_obj_set_style_text_color(hint, C_ACCENT, 0);
@@ -962,7 +1048,7 @@ static void settings_populate_user_list(void) {
     lv_obj_center(xl);
 
     lv_obj_t *title = lv_label_create(settings_panel);
-    lv_label_set_text(title, "Users");
+    lv_label_set_text(title, TR_USERS_TITLE);
     lv_obj_set_style_text_color(title, th_fg(), 0);
     lv_obj_set_style_text_font(title, &lv_font_ui_24, 0);
     lv_obj_set_pos(title, ST_PAD + 52, ST_PAD + 8);
@@ -1002,7 +1088,7 @@ static void settings_populate_user_list(void) {
 
         /* Subtitle */
         lv_obj_t *sub_lbl = lv_label_create(row);
-        lv_label_set_text(sub_lbl, is_active ? "ACTIVE  •  tap to edit calendars" : "Tap to edit calendars");
+        lv_label_set_text(sub_lbl, is_active ? TR_ACTIVE_TAP : TR_TAP_EDIT_CAL);
         lv_obj_set_style_text_color(sub_lbl, is_active ? C_ACCENT : th_muted(), 0);
         lv_obj_set_style_text_font(sub_lbl, &lv_font_ui_14, 0);
         lv_obj_set_pos(sub_lbl, 0, 28);
@@ -1057,7 +1143,7 @@ static void settings_populate_user_list(void) {
     }
     lv_obj_add_event_cb(btn_add, cb_settings_add_user, LV_EVENT_CLICKED, NULL);
     lv_obj_t *add_lbl = lv_label_create(btn_add);
-    lv_label_set_text(add_lbl, "+ Add User");
+    lv_label_set_text(add_lbl, TR_ADD_BTN);
     lv_obj_set_style_text_color(add_lbl, th_muted(), 0);
     lv_obj_set_style_text_font(add_lbl, &lv_font_ui_14, 0);
     lv_obj_center(add_lbl);
@@ -1094,7 +1180,7 @@ static void settings_populate_source_editor(int user_idx) {
     lv_obj_center(bl);
 
     char title_buf[48];
-    snprintf(title_buf, sizeof(title_buf), "%s's Calendars", users[user_idx].name);
+    snprintf(title_buf, sizeof(title_buf), "%s's kalender", users[user_idx].name);
     lv_obj_t *title = lv_label_create(settings_panel);
     lv_label_set_text(title, title_buf);
     lv_obj_set_style_text_color(title, th_fg(), 0);
@@ -1127,7 +1213,7 @@ static void settings_populate_source_editor(int user_idx) {
     lv_obj_set_style_shadow_width(btn_cancel, 0, 0);
     lv_obj_add_event_cb(btn_cancel, cb_settings_cancel_sources, LV_EVENT_CLICKED, NULL);
     lv_obj_t *cl = lv_label_create(btn_cancel);
-    lv_label_set_text(cl, "CANCEL");
+    lv_label_set_text(cl, TR_CLOSE_UPPER);
     lv_obj_set_style_text_color(cl, th_fg(), 0);
     lv_obj_set_style_text_font(cl, &lv_font_ui_14, 0);
     lv_obj_center(cl);
@@ -1140,7 +1226,7 @@ static void settings_populate_source_editor(int user_idx) {
     lv_obj_set_style_shadow_width(btn_save, 0, 0);
     lv_obj_add_event_cb(btn_save, cb_settings_save_sources, LV_EVENT_CLICKED, NULL);
     lv_obj_t *svl = lv_label_create(btn_save);
-    lv_label_set_text(svl, "SAVE");
+    lv_label_set_text(svl, TR_SAVE_UPPER);
     lv_obj_set_style_text_color(svl, C_WHITE, 0);
     lv_obj_set_style_text_font(svl, &lv_font_ui_14, 0);
     lv_obj_center(svl);
@@ -1173,14 +1259,16 @@ static void cb_refresh(lv_event_t *e) {
 static void refresh_task(void) {
     /* Handle empty task list */
     if (cal_task_count <= 0) {
-        lv_label_set_text(lbl_task_counter, "NO TASKS");
+        lv_label_set_text(lbl_task_counter, TR_NO_TASKS_UPPER);
         lv_label_set_text(lbl_task_time, "");
-        lv_label_set_text(lbl_task_title, "No tasks for today");
+        lv_label_set_text(lbl_task_title, TR_NO_TASKS_TODAY);
         lv_obj_set_style_text_color(lbl_task_title, th_muted(), 0);
         lv_obj_set_style_text_decor(lbl_task_title, LV_TEXT_DECOR_NONE, 0);
-        lv_label_set_text(lbl_btn_complete, "Complete");
+        lv_label_set_text(lbl_btn_complete, TR_BTN_COMPLETE);
         lv_obj_set_style_bg_color(btn_complete, th_muted(), 0);
         lv_obj_add_flag(badge_completed, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(img_challenge_medal_sm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lbl_challenge_progress, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
@@ -1188,7 +1276,7 @@ static void refresh_task(void) {
     cal_task_t *t = &cal_tasks[ui_current];
 
     char ctr[24];
-    snprintf(ctr, sizeof(ctr), "TASK %d OF %d", ui_current + 1, cal_task_count);
+    snprintf(ctr, sizeof(ctr), TR_TASK_N_OF_M_FMT, ui_current + 1, cal_task_count);
     lv_label_set_text(lbl_task_counter, ctr);
     lv_label_set_text(lbl_task_time, t->time);
     lv_label_set_text(lbl_task_title, t->title);
@@ -1196,15 +1284,36 @@ static void refresh_task(void) {
     if (t->completed) {
         lv_obj_set_style_text_color(lbl_task_title, th_muted(), 0);
         lv_obj_set_style_text_decor(lbl_task_title, LV_TEXT_DECOR_STRIKETHROUGH, 0);
-        lv_label_set_text(lbl_btn_complete, LV_SYMBOL_OK " Done");
+        lv_label_set_text(lbl_btn_complete, LV_SYMBOL_OK " " TR_BTN_COMPLETED);
         lv_obj_set_style_bg_color(btn_complete, th_muted(), 0);
         lv_obj_clear_flag(badge_completed, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_set_style_text_color(lbl_task_title, th_fg(), 0);
         lv_obj_set_style_text_decor(lbl_task_title, LV_TEXT_DECOR_NONE, 0);
-        lv_label_set_text(lbl_btn_complete, "Complete");
+        lv_label_set_text(lbl_btn_complete, TR_BTN_COMPLETE);
         lv_obj_set_style_bg_color(btn_complete, C_ACCENT, 0);
         lv_obj_add_flag(badge_completed, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Challenge indicator — shown whenever this task belongs to a series */
+    if (t->challenge_target > 0) {
+        int16_t extra = 0, medals = 0;
+        challenge_get_progress(t->challenge_series, &extra, &medals);
+
+        char prog_buf[24];
+        if (medals > 0) {
+            snprintf(prog_buf, sizeof(prog_buf), "x%d  %d/%d",
+                     (int)medals, (int)extra, (int)t->challenge_target);
+        } else {
+            snprintf(prog_buf, sizeof(prog_buf), "%d/%d",
+                     (int)extra, (int)t->challenge_target);
+        }
+        lv_label_set_text(lbl_challenge_progress, prog_buf);
+        lv_obj_clear_flag(img_challenge_medal_sm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lbl_challenge_progress, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(img_challenge_medal_sm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lbl_challenge_progress, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -1214,7 +1323,7 @@ static void refresh_progress(void) {
 
     char n[4], t[8];
     snprintf(n, sizeof(n), "%d", ui_completed);
-    snprintf(t, sizeof(t), "of %d", cal_task_count);
+    snprintf(t, sizeof(t), TR_OF_N_FMT, cal_task_count);
     lv_label_set_text(lbl_arc_num, n);
     lv_label_set_text(lbl_arc_total, t);
 }
@@ -1249,13 +1358,17 @@ static void refresh_sidebar(void) {
     lv_label_set_text(lbl_level_name, lvl->name);
 
     const streak_level_t *next = streak_get_next_level();
+    char days_buf[24];
     if (next) {
-        char nx[32];
-        snprintf(nx, sizeof(nx), "%" PRId32 "d to %s", (int32_t)(next->threshold - streak_data.total_days), next->name);
-        lv_label_set_text(lbl_level_next, nx);
-        lv_obj_clear_flag(lbl_level_next, LV_OBJ_FLAG_HIDDEN);
+        int32_t days_left = next->threshold - streak_data.total_days;
+        snprintf(days_buf, sizeof(days_buf), TR_DAYS_TO_NEXT_FMT, days_left);
+        lv_label_set_text(lbl_level_days, days_buf);
+        lv_label_set_text(lbl_level_next, next->name);
     } else {
-        lv_obj_add_flag(lbl_level_next, LV_OBJ_FLAG_HIDDEN);
+        int32_t days_at = streak_data.total_days - lvl->threshold;
+        snprintf(days_buf, sizeof(days_buf), TR_DAYS_AT_LVL_FMT, days_at);
+        lv_label_set_text(lbl_level_days, days_buf);
+        lv_label_set_text(lbl_level_next, lvl->name);
     }
 
     lv_bar_set_value(bar_xp, streak_get_progress_to_next(), LV_ANIM_OFF);
@@ -1307,7 +1420,7 @@ static void show_complete_screen(void) {
 
     /* Title */
     lv_obj_t *title = lv_label_create(complete_screen);
-    lv_label_set_text(title, "Day Complete");
+    lv_label_set_text(title, TR_DAY_COMPLETE);
     lv_obj_set_style_text_color(title, C_FG, 0);
     lv_obj_set_style_text_font(title, &lv_font_ui_48, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 180);
@@ -1315,15 +1428,15 @@ static void show_complete_screen(void) {
     /* Subtitle */
     lv_obj_t *sub = lv_label_create(complete_screen);
     char buf[32];
-    snprintf(buf, sizeof(buf), "All %d tasks done", cal_task_count);
+    snprintf(buf, sizeof(buf), TR_ALL_TASKS_DONE_FMT, cal_task_count);
     lv_label_set_text(sub, buf);
     lv_obj_set_style_text_color(sub, C_MUTED, 0);
     lv_obj_set_style_text_font(sub, &lv_font_ui_14, 0);
     lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 240);
 
     /* Monthly highscore info */
-    char streak_buf[48];
-    snprintf(streak_buf, sizeof(streak_buf), "%" PRId32 " days this month  •  %s",
+    char streak_buf[64];
+    snprintf(streak_buf, sizeof(streak_buf), TR_MONTH_LEVEL_FMT,
              streak_month_days(&streak_data), streak_get_level()->name);
     lv_obj_t *streak_lbl = lv_label_create(complete_screen);
     lv_label_set_text(streak_lbl, streak_buf);
@@ -1340,7 +1453,7 @@ static void show_complete_screen(void) {
     lv_obj_add_event_cb(btn, cb_back_to_tasks, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *bl = lv_label_create(btn);
-    lv_label_set_text(bl, LV_SYMBOL_LEFT " Back to tasks");
+    lv_label_set_text(bl, LV_SYMBOL_LEFT " " TR_BACK);
     lv_obj_set_style_text_color(bl, C_WHITE, 0);
     lv_obj_set_style_text_font(bl, icon_font_sm(), 0);
     lv_obj_center(bl);
@@ -1377,10 +1490,71 @@ static void user_bar_refresh(void) {
         lv_obj_set_style_border_width(user_bar_btns[i], is_active ? 0 : 1, 0);
         lv_obj_t *lbl = lv_obj_get_child(user_bar_btns[i], 0);
         if (lbl) lv_obj_set_style_text_color(lbl, is_active ? C_WHITE : th_fg(), 0);
+
+        /* Medal indicator */
+        if (!user_bar_medal_imgs[i]) continue;
+        int16_t medals = challenge_total_medals(i);
+        if (medals > 0) {
+            char mbuf[8];
+            snprintf(mbuf, sizeof(mbuf), "x%d", (int)medals);
+            lv_label_set_text(user_bar_medal_lbls[i], mbuf);
+            lv_obj_set_style_text_color(user_bar_medal_lbls[i],
+                is_active ? C_WHITE : lv_color_hex(0xB8860B), 0);
+            lv_obj_clear_flag(user_bar_medal_imgs[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(user_bar_medal_lbls[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(user_bar_medal_imgs[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(user_bar_medal_lbls[i], LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
 /* ── Leaderboard overlay ── */
+
+/* ── Leaderboard tap-reset gestures ──
+ *   5 taps  in 2 s → reset streak
+ *  10 taps  in 2 s → reset all medals (parent override)
+ * The counter persists across overlay rebuilds (static arrays), so the user
+ * can streak-reset at 5 and then continue tapping to 10 for medal reset.
+ */
+#define LB_STREAK_RESET_TAPS  5
+#define LB_MEDAL_RESET_TAPS  10
+#define LB_RESET_WINDOW_MS   2000
+
+static uint8_t  s_lb_tap_cnt[MAX_USERS];
+static uint32_t s_lb_tap_t[MAX_USERS];
+
+static void cb_lb_tap_reset(lv_event_t *e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    lv_event_stop_bubbling(e);  /* don't propagate to overlay's dismiss handler */
+
+    uint32_t now = lv_tick_get();
+    if (s_lb_tap_cnt[idx] == 0 || (now - s_lb_tap_t[idx]) > LB_RESET_WINDOW_MS) {
+        s_lb_tap_cnt[idx] = 1;
+        s_lb_tap_t[idx]   = now;
+    } else {
+        s_lb_tap_cnt[idx]++;
+    }
+
+    if (s_lb_tap_cnt[idx] == LB_STREAK_RESET_TAPS) {
+        /* Streak reset — keep counter going toward medal reset */
+        streak_reset_user(idx);
+        lv_obj_del(leaderboard_overlay);
+        leaderboard_overlay = NULL;
+        show_leaderboard();
+        if (idx == active_user) refresh_sidebar();
+        /* s_lb_tap_cnt[idx] stays at 5; tap window timestamp preserved */
+    } else if (s_lb_tap_cnt[idx] >= LB_MEDAL_RESET_TAPS) {
+        /* Medal reset */
+        s_lb_tap_cnt[idx] = 0;
+        challenge_reset_user(idx);
+        if (idx == active_user) challenge_set_active_user(active_user);
+        lv_obj_del(leaderboard_overlay);
+        leaderboard_overlay = NULL;
+        show_leaderboard();
+        user_bar_refresh();
+    }
+}
 
 static void cb_dismiss_leaderboard(lv_event_t *e) {
     hide_leaderboard();
@@ -1443,15 +1617,15 @@ static void show_leaderboard(void) {
 
     /* Title */
     lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, "THIS MONTH");
+    lv_label_set_text(title, TR_THIS_MONTH);
     lv_obj_set_style_text_color(title, C_ACCENT, 0);
     lv_obj_set_style_text_font(title, &lv_font_ui_14, 0);
     lv_obj_set_pos(title, 28, 20);
 
     lv_obj_t *sub = lv_label_create(card);
-    lv_label_set_text(sub, "tap anywhere to close");
+    lv_label_set_text(sub, TR_TAP_TO_CLOSE);
     lv_obj_set_style_text_color(sub, ui_dark_mode ? lv_color_hex(0x9CA3AF) : lv_color_hex(0x8A8A7A), 0);
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(sub, &lv_font_ui_14, 0);
     lv_obj_set_pos(sub, 28, 40);
 
     /* Rows */
@@ -1470,7 +1644,8 @@ static void show_leaderboard(void) {
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(row, 12, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, cb_lb_tap_reset, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)entries[i].idx);
 
         /* Rank number */
         char rank_buf[4];
@@ -1492,8 +1667,27 @@ static void show_leaderboard(void) {
         lv_obj_t *lvl_lbl = lv_label_create(row);
         lv_label_set_text(lvl_lbl, streak_level_for(entries[i].sd.total_days));
         lv_obj_set_style_text_color(lvl_lbl, is_active ? lv_color_hex(0xFFDDB8) : th_muted(), 0);
-        lv_obj_set_style_text_font(lvl_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_font(lvl_lbl, &lv_font_ui_14, 0);
         lv_obj_set_pos(lvl_lbl, 44, 32);
+
+        /* Medal count (shown between name and the day count) */
+        int16_t user_medals = challenge_total_medals(entries[i].idx);
+        if (user_medals > 0) {
+            lv_obj_t *medal_img = lv_image_create(row);
+            lv_image_set_src(medal_img, &img_gold_medal);
+            lv_image_set_scale(medal_img, 80);   /* ~20×20 from 64×64 */
+            lv_obj_set_pos(medal_img, 200, 18);
+            lv_obj_clear_flag(medal_img, LV_OBJ_FLAG_CLICKABLE);
+
+            char medal_buf[8];
+            snprintf(medal_buf, sizeof(medal_buf), "x%d", (int)user_medals);
+            lv_obj_t *medal_lbl = lv_label_create(row);
+            lv_label_set_text(medal_lbl, medal_buf);
+            lv_obj_set_style_text_color(medal_lbl,
+                is_active ? C_WHITE : lv_color_hex(0xB8860B), 0);
+            lv_obj_set_style_text_font(medal_lbl, &lv_font_ui_14, 0);
+            lv_obj_set_pos(medal_lbl, 226, 24);
+        }
 
         /* Days-this-month number (right-aligned) */
         char streak_buf[16];
@@ -1505,7 +1699,7 @@ static void show_leaderboard(void) {
         lv_obj_set_pos(streak_num, card_w - 32 - 80, 10);
 
         lv_obj_t *day_lbl = lv_label_create(row);
-        lv_label_set_text(day_lbl, "days");
+        lv_label_set_text(day_lbl, TR_DAYS);
         lv_obj_set_style_text_color(day_lbl, is_active ? lv_color_hex(0xFFDDB8) : th_muted(), 0);
         lv_obj_set_style_text_font(day_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_pos(day_lbl, card_w - 32 - 80, 38);
@@ -1532,6 +1726,7 @@ static void cb_switch_user(lv_event_t *e) {
     /* Load the new user's data */
     calendar_sources_load_user(active_user);
     streak_set_active_user(active_user);
+    challenge_set_active_user(active_user);
 
     /* Restore cached tasks instantly — falls back to placeholder if never fetched before */
     if (!calendar_restore_cached_tasks(active_user)) {
@@ -1553,7 +1748,11 @@ static void cb_switch_user(lv_event_t *e) {
 /* Build the horizontal user-selection strip in the right panel.
  * Hidden automatically when only one user exists (single-user mode). */
 static void build_user_bar(lv_obj_t *parent) {
-    for (int i = 0; i < MAX_USERS; i++) user_bar_btns[i] = NULL;
+    for (int i = 0; i < MAX_USERS; i++) {
+        user_bar_btns[i]       = NULL;
+        user_bar_medal_imgs[i] = NULL;
+        user_bar_medal_lbls[i] = NULL;
+    }
 
     if (user_count <= 1) return;  /* single-user: no bar, layout unchanged */
 
@@ -1583,8 +1782,37 @@ static void build_user_bar(lv_obj_t *parent) {
         lv_obj_set_style_text_color(lbl, is_active ? C_WHITE : th_fg(), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_ui_14, 0);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(lbl, btn_w - 16);
+        lv_obj_set_width(lbl, btn_w - 52);
         lv_obj_center(lbl);
+
+        /* Medal indicator — flex container keeps image and count snapped together */
+        int16_t medals = challenge_total_medals(i);
+
+        lv_obj_t *mcont = lv_obj_create(btn);
+        lv_obj_remove_style_all(mcont);
+        lv_obj_clear_flag(mcont, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_flex_flow(mcont, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(mcont, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(mcont, 3, 0);
+        lv_obj_set_size(mcont, LV_SIZE_CONTENT, 20);
+        lv_obj_align(mcont, LV_ALIGN_RIGHT_MID, -4, 0);
+        if (medals <= 0) lv_obj_add_flag(mcont, LV_OBJ_FLAG_HIDDEN);
+        user_bar_medal_imgs[i] = mcont;   /* track container for show/hide */
+
+        lv_obj_t *medal_img = lv_image_create(mcont);
+        lv_image_set_src(medal_img, &img_gold_medal);
+        lv_image_set_scale(medal_img, 64);   /* 25% of 64px → 16×16 */
+        lv_obj_clear_flag(medal_img, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *medal_lbl = lv_label_create(mcont);
+        lv_obj_set_style_text_font(medal_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(medal_lbl,
+            is_active ? C_WHITE : lv_color_hex(0xB8860B), 0);
+        char mbuf[8];
+        snprintf(mbuf, sizeof(mbuf), medals > 0 ? "x%d" : "x0", (int)medals);
+        lv_label_set_text(medal_lbl, mbuf);
+        user_bar_medal_lbls[i] = medal_lbl;
 
         user_bar_btns[i] = btn;
     }
@@ -1597,6 +1825,9 @@ static void rebuild_user_bar(void) {
             lv_obj_del(user_bar_btns[i]);
             user_bar_btns[i] = NULL;
         }
+        /* Children were deleted with the button */
+        user_bar_medal_imgs[i] = NULL;
+        user_bar_medal_lbls[i] = NULL;
     }
     if (s_mp) build_user_bar(s_mp);
 }
@@ -1644,13 +1875,13 @@ void ui_build(void) {
 
     /* Greeting + Date */
     lbl_greeting = lv_label_create(sb);
-    lv_label_set_text(lbl_greeting, "GOOD MORNING");
+    lv_label_set_text(lbl_greeting, TR_GOOD_MORNING);
     lv_obj_set_style_text_color(lbl_greeting, th_muted(), 0);
     lv_obj_set_style_text_font(lbl_greeting, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_greeting, 24, 20);
 
     lbl_date = lv_label_create(sb);
-    lv_label_set_text(lbl_date, "Loading...");
+    lv_label_set_text(lbl_date, TR_LOADING);
     lv_obj_set_style_text_color(lbl_date, th_fg(), 0);
     lv_obj_set_style_text_font(lbl_date, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_date, 24, 40);
@@ -1689,7 +1920,7 @@ void ui_build(void) {
     lv_obj_set_pos(lbl_streak_num, 64, 10);
 
     lbl_streak_label = lv_label_create(sc);
-    lv_label_set_text(lbl_streak_label, "days this month");
+    lv_label_set_text(lbl_streak_label, TR_DAYS_THIS_MONTH);
     lv_obj_set_style_text_color(lbl_streak_label, th_fg(), 0);
     lv_obj_set_style_text_font(lbl_streak_label, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_streak_label, 64, 42);
@@ -1697,7 +1928,7 @@ void ui_build(void) {
     /* Level card */
     lv_obj_t *lc = lv_obj_create(sb);
     lv_obj_remove_style_all(lc);
-    lv_obj_set_size(lc, SIDEBAR_W - BEZEL_LEFT - 48, 60);
+    lv_obj_set_size(lc, SIDEBAR_W - BEZEL_LEFT - 48, 64);
     lv_obj_set_pos(lc, 24, 152);
     lv_obj_set_style_bg_color(lc, th_card(), 0);
     lv_obj_set_style_bg_opa(lc, LV_OPA_COVER, 0);
@@ -1705,22 +1936,34 @@ void ui_build(void) {
     lv_obj_clear_flag(lc, LV_OBJ_FLAG_SCROLLABLE);
 
     lbl_level_name = lv_label_create(lc);
-    lv_label_set_text(lbl_level_name, "Starter");
+    lv_label_set_text(lbl_level_name, TR_LVL_1);
     lv_obj_set_style_text_color(lbl_level_name, th_fg(), 0);
     lv_obj_set_style_text_font(lbl_level_name, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_level_name, 16, 8);
 
-    lbl_level_next = lv_label_create(lc);
+    /* "N dagar till/som" + next/current level name in a flex row */
+    lv_obj_t *days_row = lv_obj_create(lc);
+    lv_obj_remove_style_all(days_row);
+    lv_obj_clear_flag(days_row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_flex_flow(days_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(days_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(days_row, 5, 0);
+    lv_obj_set_size(days_row, SIDEBAR_W - 80, 18);
+    lv_obj_set_pos(days_row, 16, 26);
+
+    lbl_level_days = lv_label_create(days_row);
+    lv_label_set_text(lbl_level_days, "");
+    lv_obj_set_style_text_color(lbl_level_days, th_muted(), 0);
+    lv_obj_set_style_text_font(lbl_level_days, &lv_font_ui_14, 0);
+
+    lbl_level_next = lv_label_create(days_row);
     lv_label_set_text(lbl_level_next, "");
     lv_obj_set_style_text_color(lbl_level_next, th_fg(), 0);
     lv_obj_set_style_text_font(lbl_level_next, &lv_font_ui_14, 0);
-    lv_obj_set_pos(lbl_level_next, 16, 26);
-    lv_obj_set_width(lbl_level_next, SIDEBAR_W - 80);
-    lv_label_set_long_mode(lbl_level_next, LV_LABEL_LONG_DOT);
 
     bar_xp = lv_bar_create(lc);
     lv_obj_set_size(bar_xp, SIDEBAR_W - 80, 6);
-    lv_obj_set_pos(bar_xp, 16, 48);
+    lv_obj_set_pos(bar_xp, 16, 50);
     lv_obj_set_style_bg_color(bar_xp, th_track(), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar_xp, C_ACCENT, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar_xp, 3, LV_PART_MAIN);
@@ -1750,7 +1993,7 @@ void ui_build(void) {
     lv_obj_set_pos(lbl_arc_num, (SIDEBAR_W - BEZEL_LEFT) / 2 - 8, 303);
 
     lbl_arc_total = lv_label_create(sb);
-    lv_label_set_text(lbl_arc_total, "of 0");
+    lv_label_set_text(lbl_arc_total, TR_OF_ZERO);
     lv_obj_set_style_text_color(lbl_arc_total, th_muted(), 0);
     lv_obj_set_style_text_font(lbl_arc_total, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_arc_total, (SIDEBAR_W - BEZEL_LEFT) / 2 - 14, 335);
@@ -1769,7 +2012,7 @@ void ui_build(void) {
     lv_obj_add_event_cb(btn_refresh_obj, cb_refresh, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *rl = lv_label_create(btn_refresh_obj);
-    lv_label_set_text(rl, LV_SYMBOL_REFRESH "  REFRESH");
+    lv_label_set_text(rl, LV_SYMBOL_REFRESH "  " TR_REFRESH_UPPER);
     lv_obj_set_style_text_color(rl, th_fg(), 0);
     lv_obj_set_style_text_font(rl, icon_font_sm(), 0);
     lv_obj_center(rl);
@@ -1787,9 +2030,9 @@ void ui_build(void) {
     lv_obj_add_event_cb(btn_dark, cb_toggle_dark, LV_EVENT_CLICKED, NULL);
 
     lbl_dark_btn = lv_label_create(btn_dark);
-    lv_label_set_text(lbl_dark_btn, ui_dark_mode ? LV_SYMBOL_EYE_CLOSE "  LIGHT" : LV_SYMBOL_EYE_OPEN "  DARK");
+    lv_label_set_text(lbl_dark_btn, ui_dark_mode ? LV_SYMBOL_EYE_CLOSE "  " TR_LIGHT_UPPER : LV_SYMBOL_EYE_OPEN "  " TR_DARK_UPPER);
     lv_obj_set_style_text_color(lbl_dark_btn, th_fg(), 0);
-    lv_obj_set_style_text_font(lbl_dark_btn, icon_font_sm(), 0);
+    lv_obj_set_style_text_font(lbl_dark_btn, &lv_font_ui_14, 0);
     lv_obj_center(lbl_dark_btn);
 
     lv_obj_t *btn_settings = lv_obj_create(sb);
@@ -1832,13 +2075,13 @@ void ui_build(void) {
     lv_obj_set_style_text_font(lbl_clock, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_clock, 40, 24);
 
-    /* Sleep button — subtle power icon, left of WiFi */
+    /* Sleep button — subtle power icon */
     lv_obj_t *btn_sleep = lv_obj_create(mp);
     lv_obj_remove_style_all(btn_sleep);
     lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(btn_sleep, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(btn_sleep, 32, 32);
-    lv_obj_set_pos(btn_sleep, MAIN_W - 156, 18);
+    lv_obj_set_pos(btn_sleep, MAIN_W - 196, 18);
     lv_obj_add_event_cb(btn_sleep, cb_sleep_display, LV_EVENT_CLICKED, NULL);
     lv_obj_t *sleep_lbl = lv_label_create(btn_sleep);
     lv_label_set_text(sleep_lbl, LV_SYMBOL_POWER);
@@ -1846,7 +2089,26 @@ void ui_build(void) {
     lv_obj_set_style_text_font(sleep_lbl, icon_font_sm(), 0);
     lv_obj_center(sleep_lbl);
 
-    /* WiFi status icon (top-right area, before + button) */
+    /* Volume button — speaker icon, between power and WiFi */
+    lv_obj_t *btn_vol = lv_obj_create(mp);
+    lv_obj_remove_style_all(btn_vol);
+    lv_obj_add_flag(btn_vol, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(btn_vol, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(btn_vol, 32, 32);
+    lv_obj_set_pos(btn_vol, MAIN_W - 156, 18);
+    lv_obj_add_event_cb(btn_vol, cb_volume_btn, LV_EVENT_CLICKED, NULL);
+    lbl_volume_icon = lv_label_create(btn_vol);
+    {
+        int v = sound_get_volume();
+        const char *sym = (v == 0) ? LV_SYMBOL_MUTE :
+                          (v < 50) ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_VOLUME_MAX;
+        lv_label_set_text(lbl_volume_icon, sym);
+    }
+    lv_obj_set_style_text_color(lbl_volume_icon, th_muted(), 0);
+    lv_obj_set_style_text_font(lbl_volume_icon, icon_font_sm(), 0);
+    lv_obj_center(lbl_volume_icon);
+
+    /* WiFi status icon */
     static lv_obj_t *wifi_icon = NULL;
     wifi_icon = lv_label_create(mp);
     lv_label_set_text(wifi_icon, wifi_is_connected() ? LV_SYMBOL_WIFI : LV_SYMBOL_WARNING);
@@ -1872,7 +2134,7 @@ void ui_build(void) {
 
     /* Task counter + time */
     lbl_task_counter = lv_label_create(mp);
-    lv_label_set_text(lbl_task_counter, "TASK 1 OF 1");
+    lv_label_set_text(lbl_task_counter, TR_TASK_COUNTER_INIT);
     lv_obj_set_style_text_color(lbl_task_counter, C_ACCENT, 0);
     lv_obj_set_style_text_font(lbl_task_counter, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_task_counter, 44, 170);
@@ -1892,15 +2154,30 @@ void ui_build(void) {
     lv_obj_set_style_bg_opa(badge_completed, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(badge_completed, 14, 0);
     lv_obj_t *bl = lv_label_create(badge_completed);
-    lv_label_set_text(bl, "COMPLETED");
+    lv_label_set_text(bl, TR_KB_DONE);
     lv_obj_set_style_text_color(bl, C_WHITE, 0);
     lv_obj_set_style_text_font(bl, &lv_font_ui_14, 0);
     lv_obj_center(bl);
     lv_obj_add_flag(badge_completed, LV_OBJ_FLAG_HIDDEN);
 
+    /* Challenge series indicator — medal icon + progress label */
+    img_challenge_medal_sm = lv_image_create(mp);
+    lv_image_set_src(img_challenge_medal_sm, &img_gold_medal);
+    lv_image_set_scale(img_challenge_medal_sm, 128);   /* 50% → 32×32 */
+    lv_obj_set_pos(img_challenge_medal_sm, 330, 162);
+    lv_obj_clear_flag(img_challenge_medal_sm, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(img_challenge_medal_sm, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_challenge_progress = lv_label_create(mp);
+    lv_label_set_text(lbl_challenge_progress, "");
+    lv_obj_set_style_text_color(lbl_challenge_progress, th_fg(), 0);
+    lv_obj_set_style_text_font(lbl_challenge_progress, &lv_font_ui_14, 0);
+    lv_obj_set_pos(lbl_challenge_progress, 368, 172);
+    lv_obj_add_flag(lbl_challenge_progress, LV_OBJ_FLAG_HIDDEN);
+
     /* Hero task title */
     lbl_task_title = lv_label_create(mp);
-    lv_label_set_text(lbl_task_title, "Loading...");
+    lv_label_set_text(lbl_task_title, TR_LOADING);
     lv_obj_set_style_text_color(lbl_task_title, th_fg(), 0);
     lv_obj_set_style_text_font(lbl_task_title, &lv_font_ui_48, 0);
     lv_obj_set_width(lbl_task_title, MAIN_W - 100);
@@ -1928,9 +2205,9 @@ void ui_build(void) {
     lv_obj_add_event_cb(btn_complete, cb_complete, LV_EVENT_CLICKED, NULL);
 
     lbl_btn_complete = lv_label_create(btn_complete);
-    lv_label_set_text(lbl_btn_complete, "Complete");
+    lv_label_set_text(lbl_btn_complete, TR_BTN_COMPLETE);
     lv_obj_set_style_text_color(lbl_btn_complete, C_WHITE, 0);
-    lv_obj_set_style_text_font(lbl_btn_complete, icon_font_sm(), 0);
+    lv_obj_set_style_text_font(lbl_btn_complete, &lv_font_ui_14, 0);
     lv_obj_center(lbl_btn_complete);
 
     lv_obj_t *btn_next = lv_btn_create(mp);
@@ -2018,7 +2295,22 @@ void ui_set_display_sleeping(bool sleeping) {
     if (sleeping) {
         ws2812_off();
     } else {
-        /* Trigger refresh on wake — catches midnight rollover if overnight fetch failed */
         calendar_request_refresh();
     }
+}
+
+void ui_wake_display(void) {
+    if (lvgl_port_lock(200)) {
+        if (sleep_overlay) {
+            lv_obj_del(sleep_overlay);
+            sleep_overlay = NULL;
+        }
+        display_sleeping = false;
+        lvgl_port_unlock();
+    }
+    /* LED restore and calendar refresh are safe outside the lock */
+    if (!ui_leds_suppressed) {
+        ws2812_update_progress(ui_completed, cal_task_count);
+    }
+    calendar_request_refresh();
 }

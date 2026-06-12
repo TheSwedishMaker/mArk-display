@@ -38,9 +38,10 @@ static void power_button_task(void *arg) {
                 /* Short press → toggle display */
                 display_on = !display_on;
                 set_lcd_blight(display_on ? 100 : 0);
-                ui_set_display_sleeping(!display_on);
                 if (display_on) {
-                    ui_led_refresh();
+                    ui_wake_display();   /* clears sleep overlay + restores LEDs under LVGL lock */
+                } else {
+                    ui_set_display_sleeping(true);
                 }
                 ESP_LOGI(TAG, "Display %s", display_on ? "ON" : "OFF");
             }

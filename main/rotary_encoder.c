@@ -28,14 +28,25 @@ static int64_t last_scroll_us = 0;
 #define SCROLL_DEBOUNCE_US  150000  /* 150ms between scroll events */
 
 void encoder_init(void) {
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << ENC_A_GPIO) | (1ULL << ENC_B_GPIO) | (1ULL << ENC_BTN_GPIO),
+    /* A/B: pull-up (encoder outputs pull low on transitions) */
+    gpio_config_t cfg_ab = {
+        .pin_bit_mask = (1ULL << ENC_A_GPIO) | (1ULL << ENC_B_GPIO),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&cfg);
+    gpio_config(&cfg_ab);
+
+    /* BTN: pull-down — button connects IO5 to 3.3V, so pressed = HIGH */
+    gpio_config_t cfg_btn = {
+        .pin_bit_mask = (1ULL << ENC_BTN_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg_btn);
 
     last_state = (gpio_get_level(ENC_A_GPIO) << 1) | gpio_get_level(ENC_B_GPIO);
     ESP_LOGI(TAG, "Init OK: A=IO%d B=IO%d BTN=IO%d (state=%d)",
@@ -76,5 +87,5 @@ int encoder_poll(void) {
 }
 
 bool encoder_button_pressed(void) {
-    return gpio_get_level(ENC_BTN_GPIO) == 0;
+    return gpio_get_level(ENC_BTN_GPIO) == 1;  /* active HIGH: button pulls IO5 to 3.3V */
 }

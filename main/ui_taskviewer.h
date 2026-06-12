@@ -17,3 +17,6 @@ void ui_dismiss_complete(void);
 void ui_led_refresh(void);
 /* Sync physical power button sleep state so LEDs stay off when display is off */
 void ui_set_display_sleeping(bool sleeping);
+/* Wake the display: deletes sleep overlay (if any), restores LEDs, requests refresh.
+ * Acquires the LVGL lock internally — safe to call from any task. */
+void ui_wake_display(void);

@@ -29,8 +29,10 @@ extern int cal_source_count;
 typedef struct {
     char id[64];
     char title[MAX_TITLE_LEN];
-    char time[8];       /* "HH:MM" or "All day" */
+    char time[16];      /* "HH:MM" or "Hela dagen" */
     bool completed;
+    char challenge_series[24];   /* series name from [Name:N] tag, empty if none */
+    int16_t challenge_target;    /* N from [Name:N] tag, 0 if not a challenge task */
 } cal_task_t;
 
 /* Current task list (populated by calendar_fetch) */

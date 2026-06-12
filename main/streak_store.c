@@ -18,6 +18,7 @@
  */
 #include "streak_store.h"
 #include "user_store.h"
+#include "lang.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -28,14 +29,14 @@
 
 static const char *TAG = "STREAK";
 
-/* Thresholds are lifetime completed days */
+/* Thresholds are lifetime completed days; names come from lang.h */
 static const streak_level_t LEVELS[] = {
-    { "Starter",      0   },
-    { "Consistent",   5   },
-    { "Dedicated",    15  },
-    { "Unstoppable",  30  },
-    { "Legend",       50  },
-    { "Titan",        100 },
+    { TR_LVL_1,   0   },
+    { TR_LVL_2,   5   },
+    { TR_LVL_3,   15  },
+    { TR_LVL_4,   30  },
+    { TR_LVL_5,   50  },
+    { TR_LVL_6,   100 },
 };
 #define NUM_LEVELS (sizeof(LEVELS) / sizeof(LEVELS[0]))
 
@@ -389,6 +390,91 @@ void streak_read_user(int user_idx, streak_data_t *out) {
         if (migrated)
             persist_record(user_idx, out);
     }
+}
+
+void streak_shift_down(int removed_idx, int new_count) {
+    /* When a user at removed_idx is deleted, shift all higher-index NVS
+     * namespaces down by 1 so indices stay in sync with users[]. */
+    for (int i = removed_idx; i < new_count; i++) {
+        char src_m[16], src_w[16], dst_m[16], dst_w[16];
+        ns_main(i + 1, src_m, sizeof(src_m));
+        ns_wal( i + 1, src_w, sizeof(src_w));
+        ns_main(i,     dst_m, sizeof(dst_m));
+        ns_wal( i,     dst_w, sizeof(dst_w));
+
+        /* Read the full record from i+1 (migrating legacy data if present) */
+        streak_data_t sd = {0};
+        nvs_handle_t h;
+        if (nvs_open(src_m, NVS_READONLY, &h) == ESP_OK) {
+            read_record(h, &sd, NULL);
+            nvs_close(h);
+        }
+
+        /* Write to i */
+        if (nvs_open(dst_m, NVS_READWRITE, &h) == ESP_OK) {
+            write_record(h, &sd);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+
+        /* Clear WAL at old slot */
+        if (nvs_open(src_w, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        /* Clear WAL at new slot (was overwritten above) */
+        if (nvs_open(dst_w, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+
+    /* Erase the now-orphaned last slot */
+    char last_m[16], last_w[16];
+    ns_main(new_count, last_m, sizeof(last_m));
+    ns_wal( new_count, last_w, sizeof(last_w));
+    nvs_handle_t h;
+    if (nvs_open(last_m, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h); nvs_commit(h); nvs_close(h);
+    }
+    if (nvs_open(last_w, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h); nvs_commit(h); nvs_close(h);
+    }
+
+    /* Re-sync s_loaded_user if it shifted */
+    if (s_loaded_user > removed_idx) {
+        s_loaded_user--;
+    } else if (s_loaded_user == removed_idx) {
+        s_loaded_user = -1;  /* removed user — caller must call streak_set_active_user */
+    }
+
+    ESP_LOGI(TAG, "streak_shift_down: removed=%d new_count=%d s_loaded=%d",
+             removed_idx, new_count, s_loaded_user);
+}
+
+void streak_reset_user(int user_idx) {
+    if (user_idx < 0 || user_idx >= MAX_USERS) return;
+
+    if (user_idx == s_loaded_user) {
+        memset(&streak_data, 0, sizeof(streak_data));
+        save_with_wal_for_user(user_idx);
+    } else {
+        char ns_w[16];
+        ns_wal(user_idx, ns_w, sizeof(ns_w));
+
+        nvs_handle_t wal;
+        if (nvs_open(ns_w, NVS_READWRITE, &wal) == ESP_OK) {
+            nvs_erase_all(wal);
+            nvs_commit(wal);
+            nvs_close(wal);
+        }
+
+        streak_data_t zero = {0};
+        persist_record(user_idx, &zero);
+    }
+    ESP_LOGI(TAG, "User %d scores reset to 0", user_idx);
 }
 
 /* Return the level name for a lifetime total */

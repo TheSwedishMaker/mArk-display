@@ -14,6 +14,8 @@ idf_component_register(
         "lv_font_ui_14.c"
         "lv_font_ui_24.c"
         "lv_font_ui_48.c"
+        "img_gold_medal.c"
+        "challenge_store.c"
     INCLUDE_DIRS "."
     REQUIRES
         lvgl

@@ -7,3 +7,5 @@
 void sound_init(void);
 void sound_task_complete(void);
 void sound_day_complete(void);
+void sound_set_volume(int vol);   /* 0 = mute, 100 = max */
+int  sound_get_volume(void);

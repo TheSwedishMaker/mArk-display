@@ -26,6 +26,7 @@ static const char *TAG = "CAL";
 
 /* ── Configuration ── */
 #include "secrets.h"
+#include "lang.h"
 
 #define NTP_SERVER     "pool.ntp.org"
 #define NVS_NAMESPACE  "cal_cfg"
@@ -38,6 +39,7 @@ int        cal_day_offset = 0;
 /* ── Staging buffer — fetch writes here, applied to cal_tasks[] under lock ── */
 static cal_task_t s_stage[MAX_TASKS];
 static int        s_stage_count = 0;
+static bool       s_last_fetch_succeeded = false;
 
 static bool s_wifi_connected = false;
 static bool s_time_synced = false;
@@ -329,20 +331,60 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
+/* ── Parse and strip [Name:N] challenge tag from task title ── */
+static void parse_challenge_tag(cal_task_t *ct) {
+    ct->challenge_series[0] = '\0';
+    ct->challenge_target = 0;
+
+    /* Find [Name:N] anywhere in the title */
+    char *p = strchr(ct->title, '[');
+    if (!p) return;
+
+    char *close = strchr(p + 1, ']');
+    if (!close) return;
+
+    char *colon = NULL;
+    for (char *c = p + 1; c < close; c++) {
+        if (*c == ':') { colon = c; break; }
+    }
+    if (!colon) return;
+
+    int name_len = (int)(colon - (p + 1));
+    int num_len  = (int)(close - colon - 1);
+    if (name_len <= 0 || name_len >= 24 || num_len <= 0 || num_len >= 8) return;
+
+    char num_buf[8];
+    memcpy(num_buf, colon + 1, num_len);
+    num_buf[num_len] = '\0';
+    int n = atoi(num_buf);
+    if (n <= 0) return;
+
+    memcpy(ct->challenge_series, p + 1, name_len);
+    ct->challenge_series[name_len] = '\0';
+    ct->challenge_target = (int16_t)n;
+
+    /* Strip tag and any surrounding spaces from display title */
+    char *tag_start = p;
+    while (tag_start > ct->title && *(tag_start - 1) == ' ') tag_start--;
+    char *rest = close + 1;
+    while (*rest == ' ') rest++;
+    memmove(tag_start, rest, strlen(rest) + 1);
+}
+
 /* ── Parse ISO8601 time → "HH:MM" ── */
 static void parse_time(const char *iso, char *out, size_t len) {
     const char *t = strchr(iso, 'T');
     if (t && strlen(t) >= 6) {
         snprintf(out, len, "%.5s", t + 1);
     } else {
-        snprintf(out, len, "All day");
+        snprintf(out, len, TR_ALL_DAY);
     }
 }
 
 typedef struct {
     char uid[64];
     char summary[MAX_TITLE_LEN];
-    char time[8];
+    char time[16];
     bool all_day;
     bool has_start;
     bool has_end;
@@ -371,7 +413,7 @@ static bool ics_parse_datetime(const char *value, bool *all_day, time_t *out_ts,
     if (!tpos) {
         *all_day = true;
         if (out_time && out_time_len > 0) {
-            snprintf(out_time, out_time_len, "All day");
+            snprintf(out_time, out_time_len, TR_ALL_DAY);
         }
         tm_val.tm_hour = 0;
         tm_val.tm_min = 0;
@@ -447,8 +489,9 @@ static void ics_commit_event(const ics_event_t *event, time_t day_start, time_t 
     ct->id[sizeof(ct->id) - 1] = '\0';
     strncpy(ct->title, event->summary, MAX_TITLE_LEN - 1);
     ct->title[MAX_TITLE_LEN - 1] = '\0';
-    strncpy(ct->time, event->time[0] ? event->time : "All day", sizeof(ct->time) - 1);
+    strncpy(ct->time, event->time[0] ? event->time : TR_ALL_DAY, sizeof(ct->time) - 1);
     ct->time[sizeof(ct->time) - 1] = '\0';
+    parse_challenge_tag(ct);
     ct->completed = was_completed(ct);
     s_stage_count++;
 }
@@ -522,13 +565,14 @@ static bool fetch_google(const char *calendar_id, const char *time_min, const ch
             strncpy(ct->title, cJSON_IsString(summary) ? summary->valuestring : "Untitled",
                     MAX_TITLE_LEN - 1);
             ct->title[MAX_TITLE_LEN - 1] = '\0';
+            parse_challenge_tag(ct);
 
             if (start) {
                 cJSON *dt = cJSON_GetObjectItem(start, "dateTime");
                 if (cJSON_IsString(dt)) {
                     parse_time(dt->valuestring, ct->time, sizeof(ct->time));
                 } else {
-                    snprintf(ct->time, sizeof(ct->time), "All day");
+                    snprintf(ct->time, sizeof(ct->time), TR_ALL_DAY);
                 }
             }
 
@@ -748,9 +792,9 @@ static bool fetch_ics(const char *ics_url, int year, int month, int day) {
 static int task_time_cmp(const void *a, const void *b) {
     const cal_task_t *ta = (const cal_task_t *)a;
     const cal_task_t *tb = (const cal_task_t *)b;
-    /* "All day" sorts first */
-    bool a_allday = (strcmp(ta->time, "All day") == 0 || ta->time[0] == '\0');
-    bool b_allday = (strcmp(tb->time, "All day") == 0 || tb->time[0] == '\0');
+    /* TR_ALL_DAY sorts first */
+    bool a_allday = (strcmp(ta->time, TR_ALL_DAY) == 0 || ta->time[0] == '\0');
+    bool b_allday = (strcmp(tb->time, TR_ALL_DAY) == 0 || tb->time[0] == '\0');
     if (a_allday && !b_allday) return -1;
     if (!a_allday && b_allday) return 1;
     return strcmp(ta->time, tb->time);
@@ -766,7 +810,7 @@ bool calendar_fetch(void) {
     }
     s_suppress_completion_save = false;
 
-    if (!s_wifi_connected || !s_time_synced) return false;
+    if (!s_wifi_connected || !s_time_synced) { s_last_fetch_succeeded = false; return false; }
 
     time_t now;
     time(&now);
@@ -826,15 +870,8 @@ bool calendar_fetch(void) {
         qsort(s_stage, s_stage_count, sizeof(cal_task_t), task_time_cmp);
     }
 
-    if (s_stage_count == 0) {
-        strncpy(s_stage[0].title, "No events", MAX_TITLE_LEN - 1);
-        s_stage[0].id[0] = '\0';
-        s_stage[0].time[0] = '\0';
-        s_stage[0].completed = false;
-        s_stage_count = 1;
-    }
-
     ESP_LOGI(TAG, "Fetch done: %d event(s) from %d source(s)", s_stage_count, cal_source_count);
+    s_last_fetch_succeeded = true;
     return true;
 }
 
@@ -842,22 +879,22 @@ bool calendar_fetch(void) {
 void calendar_apply_staged(void) {
     int n = s_stage_count < MAX_TASKS ? s_stage_count : MAX_TASKS;
 
-    /* Cache for instant user-switch restore — under the user the fetch was
-     * actually FOR (s_fetch_user), not whoever is active now. Tag with
-     * today's date so stale caches from a previous day are rejected.
-     * Don't cache the "No events" fallback — a failed fetch shouldn't
-     * overwrite a valid cache or spread to other users. */
-    bool is_real_result = !(n == 1 && strcmp(s_stage[0].title, "No events") == 0);
-    if (is_real_result && s_fetch_user >= 0 && s_fetch_user < MAX_USERS) {
+    /* Cache for instant user-switch restore — only results from a successful
+     * fetch (a failed fetch must not overwrite a valid cache), and under the
+     * user the fetch was actually FOR (s_fetch_user), not whoever is active
+     * now. Tag with today's date so stale caches from a previous day are
+     * rejected on restore. */
+    if (s_last_fetch_succeeded && s_fetch_user >= 0 && s_fetch_user < MAX_USERS) {
         memcpy(s_task_cache[s_fetch_user], s_stage, n * sizeof(cal_task_t));
         s_task_cache_count[s_fetch_user] = n;
         s_task_cache_valid[s_fetch_user] = true;
         time_t now = time(NULL);
         now += cal_day_offset * 86400;
         struct tm ct;
-        gmtime_r(&now, &ct);
+        localtime_r(&now, &ct);
         snprintf(s_task_cache_date[s_fetch_user], sizeof(s_task_cache_date[0]),
                  "%04d%02d%02d", ct.tm_year + 1900, ct.tm_mon + 1, ct.tm_mday);
+
     }
 
     /* Only touch the live view if the fetched user is still active — a user
@@ -881,7 +918,7 @@ bool calendar_restore_cached_tasks(int user_idx) {
     time_t now = time(NULL);
     now += cal_day_offset * 86400;
     struct tm ct;
-    gmtime_r(&now, &ct);
+    localtime_r(&now, &ct);
     char today[9];
     snprintf(today, sizeof(today), "%04d%02d%02d", ct.tm_year + 1900, ct.tm_mon + 1, ct.tm_mday);
     if (strcmp(s_task_cache_date[user_idx], today) != 0) {
@@ -896,10 +933,7 @@ bool calendar_restore_cached_tasks(int user_idx) {
 }
 
 void calendar_set_offline_placeholder(void) {
-    strncpy(cal_tasks[0].title, "No tasks", MAX_TITLE_LEN - 1);
-    cal_tasks[0].time[0] = '\0';
-    cal_tasks[0].completed = false;
-    cal_task_count = 1;
+    cal_task_count = 0;
 }
 
 int calendar_get_completed(void) {
@@ -916,9 +950,9 @@ void calendar_get_greeting(char *buf, size_t len) {
     time(&now);
     struct tm t;
     localtime_r(&now, &t);
-    if (t.tm_hour < 12) snprintf(buf, len, "GOOD MORNING");
-    else if (t.tm_hour < 17) snprintf(buf, len, "GOOD AFTERNOON");
-    else snprintf(buf, len, "GOOD EVENING");
+    if (t.tm_hour < 12) snprintf(buf, len, TR_GOOD_MORNING);
+    else if (t.tm_hour < 17) snprintf(buf, len, TR_GOOD_AFTERNOON);
+    else snprintf(buf, len, TR_GOOD_EVENING);
 }
 
 void calendar_get_date_str(char *buf, size_t len) {
@@ -926,15 +960,15 @@ void calendar_get_date_str(char *buf, size_t len) {
     time(&now);
     struct tm t;
     localtime_r(&now, &t);
-    const char *days[] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
-    const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    const char *days[] = TR_DAY_NAMES;
+    const char *months[] = TR_MONTH_NAMES;
     snprintf(buf, len, "%s, %s %d", days[t.tm_wday], months[t.tm_mon], t.tm_mday);
 }
 
 void calendar_get_day_label(char *buf, size_t len) {
-    if (cal_day_offset == 0) snprintf(buf, len, "Today");
-    else if (cal_day_offset == 1) snprintf(buf, len, "Tomorrow");
-    else if (cal_day_offset == -1) snprintf(buf, len, "Yesterday");
+    if (cal_day_offset == 0) snprintf(buf, len, TR_TODAY);
+    else if (cal_day_offset == 1) snprintf(buf, len, TR_TOMORROW);
+    else if (cal_day_offset == -1) snprintf(buf, len, TR_YESTERDAY);
     else {
         time_t now;
         time(&now);

@@ -58,3 +58,9 @@ int streak_get_progress_to_next(void);
 /* Read any user's data from NVS without affecting the active user */
 void streak_read_user(int user_idx, streak_data_t *out);
 const char *streak_level_for(int32_t total_days);
+
+/** Reset a user's scores to zero and persist to NVS. */
+void streak_reset_user(int user_idx);
+
+/** Call after user_store_remove(idx) to keep NVS namespaces in sync. */
+void streak_shift_down(int removed_idx, int new_count);

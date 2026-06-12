@@ -18,6 +18,7 @@
 
 #include "calendar_fetch.h"
 #include "streak_store.h"
+#include "challenge_store.h"
 #include "ui_taskviewer.h"
 #include "ws2812_led.h"
 #include "power_button.h"
@@ -52,6 +53,7 @@ static void system_init(void) {
     ESP_LOGI(TAG, "NVS ready");
 
     /* 2. LDO regulators (required for display) */
+    ws2812_set_all(64, 0, 0); /* RED: acquiring LDOs */
     esp_ldo_channel_config_t ldo3_cfg = { .chan_id = 3, .voltage_mv = 2500 };
     err = esp_ldo_acquire_channel(&ldo3_cfg, &ldo3);
     if (err != ESP_OK) init_fail("LDO3", err);
@@ -60,26 +62,35 @@ static void system_init(void) {
     err = esp_ldo_acquire_channel(&ldo4_cfg, &ldo4);
     if (err != ESP_OK) init_fail("LDO4", err);
     ESP_LOGI(TAG, "LDO3/LDO4 ready");
+    vTaskDelay(pdMS_TO_TICKS(100)); /* allow display/touch hardware to power up */
 
     /* 3. I2C (for touch controller) */
+    ws2812_set_all(64, 32, 0); /* ORANGE: I2C init */
     err = i2c_init();
     if (err != ESP_OK) init_fail("I2C", err);
     ESP_LOGI(TAG, "I2C ready");
 
-    /* 4. Touch panel */
+    /* 4. Touch panel (non-fatal: display can work without touch) */
+    ws2812_set_all(64, 64, 0); /* YELLOW: touch init */
     err = touch_init();
-    if (err != ESP_OK) init_fail("Touch", err);
-    ESP_LOGI(TAG, "Touch ready");
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Touch init failed (%s) — continuing without touch", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Touch ready");
+    }
 
     /* 5. Display (MIPI-DSI + LVGL) */
+    ws2812_set_all(0, 0, 64); /* BLUE: display init */
     err = display_init();
     if (err != ESP_OK) init_fail("Display", err);
     ESP_LOGI(TAG, "Display ready");
 
     /* 6. Backlight */
+    ws2812_set_all(0, 64, 0); /* GREEN: backlight on */
     err = set_lcd_blight(100);
     if (err != ESP_OK) init_fail("Backlight", err);
     ESP_LOGI(TAG, "Backlight on");
+    ws2812_set_all(0, 0, 0); /* off: normal operation */
 }
 
 /* ── Calendar refresh task (also handles deferred web config refreshes) ── */
@@ -162,17 +173,24 @@ static void encoder_task(void *arg) {
         /* Push button: toggle complete on current task (works even on complete screen) */
         bool btn_pressed = encoder_button_pressed();
         if (btn_pressed && !btn_was_pressed) {
-            if (ui_is_complete_shown()) {
-                /* Dismiss complete screen first */
-                if (lvgl_port_lock(100)) {
-                    ui_dismiss_complete();
-                    lvgl_port_unlock();
+            static uint32_t btn_last_ms = 0;
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if ((now_ms - btn_last_ms) >= 400) {   /* 400ms debounce — kills contact bounce */
+                bool handled = false;
+                if (ui_is_complete_shown()) {
+                    if (lvgl_port_lock(100)) {
+                        ui_dismiss_complete();
+                        lvgl_port_unlock();
+                        handled = true;
+                    }
+                } else {
+                    if (lvgl_port_lock(100)) {
+                        ui_complete_current_task();
+                        lvgl_port_unlock();
+                        handled = true;
+                    }
                 }
-            } else {
-                if (lvgl_port_lock(100)) {
-                    ui_complete_current_task();
-                    lvgl_port_unlock();
-                }
+                if (handled) btn_last_ms = now_ms;
             }
         }
         btn_was_pressed = btn_pressed;
@@ -209,6 +227,9 @@ void app_main(void) {
     user_store_init();
     ESP_LOGI(TAG, "User store ready (%d user(s), active=%d)", user_count, active_user);
 
+    challenge_store_init();
+    ESP_LOGI(TAG, "Challenge store ready");
+
     /* Load saved calendar sources for the active user */
     calendar_sources_load();
 
@@ -218,7 +239,7 @@ void app_main(void) {
     /* Show loading screen */
     if (lvgl_port_lock(0)) {
         lv_obj_t *loading = lv_label_create(lv_scr_act());
-        lv_label_set_text(loading, "Connecting...");
+        lv_label_set_text(loading, "Ansluter...");
         lv_obj_set_style_text_color(loading, lv_color_hex(0x6E7080), 0);
         lv_obj_set_style_text_font(loading, &lv_font_montserrat_14, 0);
         lv_obj_center(loading);

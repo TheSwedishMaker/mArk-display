@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "SND";
 
@@ -29,11 +31,26 @@ static const char *TAG = "SND";
 static i2s_chan_handle_t tx_chan = NULL;
 static QueueHandle_t sound_queue = NULL;
 static bool sound_ready = false;
+static int  s_volume = 80;   /* 0–100, persisted in NVS */
 
 typedef enum { SOUND_TASK_COMPLETE = 1, SOUND_DAY_COMPLETE = 2 } sound_event_t;
 
 static void amp_on(void)  { gpio_set_level(AMP_CTRL_PIN, 0); }
 static void amp_off(void) { gpio_set_level(AMP_CTRL_PIN, 1); }
+
+void sound_set_volume(int vol) {
+    if (vol < 0)   vol = 0;
+    if (vol > 100) vol = 100;
+    s_volume = vol;
+    nvs_handle_t h;
+    if (nvs_open("settings", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "volume", vol);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+int sound_get_volume(void) { return s_volume; }
 
 static void play_tone(uint16_t freq, uint16_t duration_ms, uint8_t volume) {
     if (!sound_ready || !tx_chan) {
@@ -49,7 +66,7 @@ static void play_tone(uint16_t freq, uint16_t duration_ms, uint8_t volume) {
 
     int total_samples = (SAMPLE_RATE * duration_ms) / 1000;
     int16_t buf[256];  /* stereo: L+R per sample = 2 int16 per sample, 64 samples max */
-    float amplitude = (32767.0f * volume) / 100.0f;
+    float amplitude = (32767.0f * volume * s_volume) / (100.0f * 100.0f);
 
     int idx = 0;
     while (idx < total_samples) {
@@ -116,6 +133,15 @@ static void sound_worker(void *arg) {
 
 void sound_init(void) {
     ESP_LOGW(TAG, "===== Sound init starting =====");
+
+    /* Load persisted volume */
+    nvs_handle_t nvs_h;
+    if (nvs_open("settings", NVS_READONLY, &nvs_h) == ESP_OK) {
+        int32_t vol = 80;
+        nvs_get_i32(nvs_h, "volume", &vol);
+        s_volume = (int)vol;
+        nvs_close(nvs_h);
+    }
 
     /* Enable amplifier (NS4168 CTRL pin) */
     gpio_config_t io_conf = {
