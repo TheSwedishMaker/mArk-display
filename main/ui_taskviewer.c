@@ -19,6 +19,7 @@
 #include "web_config.h"
 #include "user_store.h"
 #include "bsp_illuminate.h"
+#include "timer_engine.h"
 
 
 static const char *TAG = "UI";
@@ -148,6 +149,17 @@ static lv_obj_t *leaderboard_overlay = NULL;
 static lv_obj_t *sleep_overlay = NULL;
 static bool      display_sleeping = false;
 
+/* ── Timer button (on task card) ── */
+static lv_obj_t *btn_timer     = NULL;
+static lv_obj_t *lbl_btn_timer = NULL;
+
+/* ── Timer popup state ── */
+static lv_obj_t   *s_timer_popup           = NULL;   /* full-screen overlay */
+static lv_obj_t   *s_timer_popup_arc       = NULL;
+static lv_obj_t   *s_timer_popup_lbl       = NULL;   /* mm:ss or "Stopp" */
+static lv_obj_t   *s_timer_popup_pause_lbl = NULL;   /* pause/play button label */
+static lv_timer_t *s_timer_popup_lv_timer  = NULL;   /* 250 ms update tick */
+
 /* ── Forward declarations ── */
 static void refresh_task(void);
 static void refresh_progress(void);
@@ -158,6 +170,9 @@ static void user_bar_refresh(void);
 static void show_leaderboard(void);
 static void hide_complete_screen(void);
 static void cb_clock_tick(lv_timer_t *t);
+static void close_timer_popup(void);
+static void show_timer_popup(void);
+static void on_timer_expired(void *arg);
 
 /* ── Callbacks for completion screen (C doesn't have lambdas) ── */
 static void cb_back_to_tasks(lv_event_t *e) {
@@ -1255,6 +1270,305 @@ static void cb_refresh(lv_event_t *e) {
     calendar_request_refresh();
 }
 
+/* ── Timer feature ── */
+
+static void close_timer_popup(void) {
+    if (s_timer_popup_lv_timer) {
+        lv_timer_del(s_timer_popup_lv_timer);
+        s_timer_popup_lv_timer = NULL;
+    }
+    if (s_timer_popup) {
+        lv_obj_del(s_timer_popup);
+        s_timer_popup           = NULL;
+        s_timer_popup_arc       = NULL;
+        s_timer_popup_lbl       = NULL;
+        s_timer_popup_pause_lbl = NULL;
+    }
+}
+
+/* Tick callback at 250 ms — updates arc and label while popup is visible */
+static void cb_timer_popup_tick(lv_timer_t *t) {
+    (void)t;
+    if (!s_timer_popup) return;
+    const timer_state_t *ts = timer_engine_get_state();
+    uint32_t rem = timer_engine_remaining_sec();
+
+    if (s_timer_popup_arc) {
+        lv_arc_set_value(s_timer_popup_arc, (int32_t)rem);
+    }
+    if (s_timer_popup_lbl) {
+        if (ts->expired) {
+            lv_label_set_text(s_timer_popup_lbl, "Stopp");
+        } else {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+            lv_label_set_text(s_timer_popup_lbl, buf);
+        }
+    }
+}
+
+/* 1 s tick — keeps timer button countdown fresh without a full refresh */
+static void cb_timer_btn_tick(lv_timer_t *t) {
+    (void)t;
+    if (!btn_timer || !lbl_btn_timer || cal_task_count <= 0) return;
+    const timer_state_t *ts = timer_engine_get_state();
+    if (!ts->active && !ts->paused) return;
+    if (ts->task_idx != ui_current || ts->user_idx != active_user) return;
+    uint32_t rem = timer_engine_remaining_sec();
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+    lv_label_set_text(lbl_btn_timer, buf);
+}
+
+/* Close timer popup — cancel if expired, just hide if running */
+static void cb_timer_popup_close(lv_event_t *e) {
+    (void)e;
+    const timer_state_t *ts = timer_engine_get_state();
+    if (ts->expired) {
+        sound_timer_stop();
+        timer_engine_cancel();
+    }
+    close_timer_popup();
+    refresh_task();
+}
+
+/* Card click in expired state cancels the timer */
+static void cb_timer_card_click(lv_event_t *e) {
+    (void)e;
+    const timer_state_t *ts = timer_engine_get_state();
+    if (ts->expired) {
+        sound_timer_stop();
+        timer_engine_cancel();
+        close_timer_popup();
+        refresh_task();
+    }
+}
+
+static void cb_timer_pause(lv_event_t *e) {
+    (void)e;
+    const timer_state_t *ts = timer_engine_get_state();
+    if (ts->paused) {
+        timer_engine_resume();
+    } else {
+        timer_engine_pause();
+    }
+    if (s_timer_popup_pause_lbl) {
+        const timer_state_t *nts = timer_engine_get_state();
+        lv_label_set_text(s_timer_popup_pause_lbl,
+                          nts->paused ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+    }
+}
+
+static void cb_timer_restart(lv_event_t *e) {
+    (void)e;
+    sound_timer_stop();
+    timer_engine_reset();
+    close_timer_popup();
+    show_timer_popup();
+}
+
+static void show_timer_popup(void) {
+    close_timer_popup();  /* close any existing popup first */
+
+    const timer_state_t *ts = timer_engine_get_state();
+    bool expired = ts->expired;
+    uint32_t rem = timer_engine_remaining_sec();
+
+    /* Full-screen semi-transparent overlay — clicks outside card close popup */
+    s_timer_popup = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(s_timer_popup);
+    lv_obj_set_size(s_timer_popup, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_timer_popup, 0, 0);
+    lv_obj_set_style_bg_color(s_timer_popup, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_timer_popup, LV_OPA_50, 0);
+    lv_obj_add_flag(s_timer_popup, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(s_timer_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_timer_popup, cb_timer_popup_close, LV_EVENT_CLICKED, NULL);
+
+    /* Modal card */
+    lv_obj_t *card = lv_obj_create(s_timer_popup);
+    lv_obj_set_size(card, 280, 320);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, th_bg(), 0);
+    lv_obj_set_style_radius(card, 20, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_shadow_width(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(card, cb_timer_card_click, LV_EVENT_CLICKED, NULL);
+
+    /* Depleting arc (full circle, orange indicator, gray background) */
+    lv_obj_t *arc = lv_arc_create(card);
+    lv_obj_set_size(arc, 200, 200);
+    lv_obj_align(arc, LV_ALIGN_TOP_MID, 0, 24);
+    lv_arc_set_rotation(arc, 270);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_range(arc, 0, (int32_t)ts->duration_sec);
+    lv_arc_set_value(arc, (int32_t)rem);
+    lv_obj_set_style_arc_color(arc, C_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(arc, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, th_track(), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_border_width(arc, 0, LV_PART_KNOB);
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    s_timer_popup_arc = arc;
+
+    /* Centre label overlaid on arc: "mm:ss" while running, "Stopp" when expired */
+    lv_obj_t *lbl = lv_label_create(card);
+    if (expired) {
+        lv_label_set_text(lbl, "Stopp");
+    } else {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+        lv_label_set_text(lbl, buf);
+    }
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_48, 0);
+    lv_obj_set_style_text_color(lbl, th_fg(), 0);
+    lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 100);
+    s_timer_popup_lbl = lbl;
+
+    /* Button row */
+    int btn_row_y = 258;
+    if (!expired) {
+        /* Pause / play button */
+        lv_obj_t *btn_pause = lv_btn_create(card);
+        lv_obj_set_size(btn_pause, 52, 52);
+        lv_obj_set_pos(btn_pause, 70, btn_row_y);
+        lv_obj_set_style_bg_color(btn_pause, th_fg(), 0);
+        lv_obj_set_style_radius(btn_pause, 26, 0);
+        lv_obj_set_style_shadow_width(btn_pause, 0, 0);
+        lv_obj_add_event_cb(btn_pause, cb_timer_pause, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *pl = lv_label_create(btn_pause);
+        lv_label_set_text(pl, ts->paused ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+        lv_obj_set_style_text_color(pl, th_bg(), 0);
+        lv_obj_set_style_text_font(pl, icon_font_md(), 0);
+        lv_obj_center(pl);
+        s_timer_popup_pause_lbl = pl;
+    }
+
+    /* Restart button */
+    int restart_x = expired ? 114 : 158;
+    lv_obj_t *btn_restart = lv_btn_create(card);
+    lv_obj_set_size(btn_restart, 52, 52);
+    lv_obj_set_pos(btn_restart, restart_x, btn_row_y);
+    lv_obj_set_style_bg_color(btn_restart, th_fg(), 0);
+    lv_obj_set_style_radius(btn_restart, 26, 0);
+    lv_obj_set_style_shadow_width(btn_restart, 0, 0);
+    lv_obj_add_event_cb(btn_restart, cb_timer_restart, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *rl = lv_label_create(btn_restart);
+    lv_label_set_text(rl, LV_SYMBOL_REFRESH);
+    lv_obj_set_style_text_color(rl, th_bg(), 0);
+    lv_obj_set_style_text_font(rl, icon_font_md(), 0);
+    lv_obj_center(rl);
+
+    /* 250 ms tick to keep arc and label updated */
+    s_timer_popup_lv_timer = lv_timer_create(cb_timer_popup_tick, 250, NULL);
+}
+
+/* Show "already running" blocking notice */
+static void cb_busy_popup_autodismiss(lv_timer_t *t) {
+    lv_obj_t *overlay = (lv_obj_t *)lv_timer_get_user_data(t);
+    lv_timer_del(t);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void cb_busy_popup_close(lv_event_t *e) {
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void show_timer_busy_popup(void) {
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(overlay, 0, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_40, 0);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(overlay, cb_busy_popup_close, LV_EVENT_CLICKED, overlay);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 320, 110);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, th_bg(), 0);
+    lv_obj_set_style_radius(card, 16, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_shadow_width(card, 0, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *lbl = lv_label_create(card);
+    lv_label_set_text(lbl, "En timer k\xC3\xB6rs\nredan i bakgrunden");
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl, 280);
+    lv_obj_set_style_text_font(lbl, &lv_font_ui_14, 0);
+    lv_obj_set_style_text_color(lbl, th_fg(), 0);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+
+    lv_timer_t *t = lv_timer_create(cb_busy_popup_autodismiss, 3000, overlay);
+    lv_timer_set_repeat_count(t, 1);
+}
+
+static void cb_timer_btn(lv_event_t *e) {
+    (void)e;
+    if (cal_task_count <= 0 || ui_current >= cal_task_count) return;
+
+    const timer_state_t *ts = timer_engine_get_state();
+    bool same_task = (ts->task_idx == ui_current && ts->user_idx == active_user);
+
+    if (timer_engine_is_busy() || ts->expired) {
+        if (!same_task) {
+            show_timer_busy_popup();
+            return;
+        }
+        /* Same task — reopen the popup (may have been closed while timer runs) */
+        show_timer_popup();
+        return;
+    }
+
+    /* Start a fresh timer */
+    cal_task_t *ct = &cal_tasks[ui_current];
+    timer_engine_start(ui_current, active_user, ct->timer_duration_sec);
+    show_timer_popup();
+}
+
+/* Called via lv_async_call when the esp_timer fires expiry — runs in LVGL context */
+static void on_timer_expired(void *arg) {
+    (void)arg;
+    const timer_state_t *ts = timer_engine_get_state();
+
+    /* Switch user if timer was running for a different user */
+    if (ts->user_idx != active_user && ts->user_idx < user_count) {
+        calendar_save_completion_state();
+        calendar_sources_save_user(active_user);
+        active_user = ts->user_idx;
+        user_store_save();
+        calendar_sources_load_user(active_user);
+        streak_set_active_user(active_user);
+        challenge_set_active_user(active_user);
+        if (!calendar_restore_cached_tasks(active_user)) {
+            calendar_set_offline_placeholder();
+        }
+        calendar_save_completion_state();
+        calendar_suppress_next_completion_save();
+        calendar_request_refresh();
+    }
+
+    /* Navigate to the expired task */
+    if (ts->task_idx >= 0 && ts->task_idx < cal_task_count) {
+        ui_current = ts->task_idx;
+    }
+
+    ui_completed = calendar_get_completed();
+    ui_refresh_all();
+
+    /* Alarm and popup */
+    sound_timer_alarm();
+    show_timer_popup();  /* shows in expired state since ts->expired == true */
+}
+
 /* ── Refresh functions ── */
 static void refresh_task(void) {
     /* Handle empty task list */
@@ -1269,6 +1583,7 @@ static void refresh_task(void) {
         lv_obj_add_flag(badge_completed, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(img_challenge_medal_sm, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_challenge_progress, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(btn_timer, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
@@ -1314,6 +1629,30 @@ static void refresh_task(void) {
     } else {
         lv_obj_add_flag(img_challenge_medal_sm, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_challenge_progress, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* Timer button */
+    if (t->timer_duration_sec > 0) {
+        lv_obj_clear_flag(btn_timer, LV_OBJ_FLAG_HIDDEN);
+        const timer_state_t *ts = timer_engine_get_state();
+        bool timer_here = (ts->active || ts->paused || ts->expired) &&
+                          ts->task_idx == ui_current && ts->user_idx == active_user;
+        if (timer_here) {
+            uint32_t rem = timer_engine_remaining_sec();
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
+            lv_label_set_text(lbl_btn_timer, buf);
+            lv_obj_set_style_bg_color(btn_timer,
+                                      ts->paused ? th_muted() : C_ACCENT, 0);
+        } else {
+            uint32_t min = (t->timer_duration_sec + 59) / 60;
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%d min", (int)min);
+            lv_label_set_text(lbl_btn_timer, buf);
+            lv_obj_set_style_bg_color(btn_timer, C_ACCENT, 0);
+        }
+    } else {
+        lv_obj_add_flag(btn_timer, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -2223,6 +2562,25 @@ void ui_build(void) {
     lv_obj_set_style_text_font(nl, icon_font_sm(), 0);
     lv_obj_center(nl);
 
+    /* Timer button — left of btn_complete, hidden until a [T] task is current */
+    btn_timer = lv_btn_create(mp);
+    lv_obj_set_size(btn_timer, 120, 52);
+    lv_obj_set_pos(btn_timer, MAIN_W - 388, PANEL_H - 72);
+    lv_obj_set_style_bg_color(btn_timer, C_ACCENT, 0);
+    lv_obj_set_style_radius(btn_timer, 12, 0);
+    lv_obj_set_style_shadow_width(btn_timer, 0, 0);
+    lv_obj_add_flag(btn_timer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(btn_timer, cb_timer_btn, LV_EVENT_CLICKED, NULL);
+
+    lbl_btn_timer = lv_label_create(btn_timer);
+    lv_label_set_text(lbl_btn_timer, "");
+    lv_obj_set_style_text_color(lbl_btn_timer, C_WHITE, 0);
+    lv_obj_set_style_text_font(lbl_btn_timer, &lv_font_ui_14, 0);
+    lv_obj_center(lbl_btn_timer);
+
+    /* Register expiry callback — fires in LVGL context via lv_async_call */
+    timer_engine_set_expiry_cb(on_timer_expired);
+
     /* Initial render */
     refresh_dots();
     refresh_progress();
@@ -2232,6 +2590,9 @@ void ui_build(void) {
 
     /* Clock update timer (every 10 seconds) */
     lv_timer_create(cb_clock_tick, 10000, NULL);
+
+    /* Timer button countdown ticker (every 1 second) */
+    lv_timer_create(cb_timer_btn_tick, 1000, NULL);
 
     /* Bezel = screen black background showing through — no extra objects needed */
 

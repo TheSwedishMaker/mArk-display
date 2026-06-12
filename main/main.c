@@ -26,6 +26,7 @@
 #include "sound_driver.h"
 #include "web_config.h"
 #include "user_store.h"
+#include "timer_engine.h"
 
 static const char *TAG = "MAIN";
 
@@ -235,6 +236,9 @@ void app_main(void) {
 
     sound_init();
     ESP_LOGI(TAG, "Sound ready");
+
+    timer_engine_init();
+    ESP_LOGI(TAG, "Timer engine ready");
 
     /* Show loading screen */
     if (lvgl_port_lock(0)) {

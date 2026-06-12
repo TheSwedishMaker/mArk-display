@@ -16,6 +16,7 @@ idf_component_register(
         "lv_font_ui_48.c"
         "img_gold_medal.c"
         "challenge_store.c"
+        "timer_engine.c"
     INCLUDE_DIRS "."
     REQUIRES
         lvgl

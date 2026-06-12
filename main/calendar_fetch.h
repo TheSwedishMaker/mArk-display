@@ -33,6 +33,7 @@ typedef struct {
     bool completed;
     char challenge_series[24];   /* series name from [Name:N] tag, empty if none */
     int16_t challenge_target;    /* N from [Name:N] tag, 0 if not a challenge task */
+    uint32_t timer_duration_sec; /* 0 = no timer; set when [T] tag is present */
 } cal_task_t;
 
 /* Current task list (populated by calendar_fetch) */

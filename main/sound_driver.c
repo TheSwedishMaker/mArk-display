@@ -33,7 +33,14 @@ static QueueHandle_t sound_queue = NULL;
 static bool sound_ready = false;
 static int  s_volume = 80;   /* 0–100, persisted in NVS */
 
-typedef enum { SOUND_TASK_COMPLETE = 1, SOUND_DAY_COMPLETE = 2 } sound_event_t;
+typedef enum {
+    SOUND_TASK_COMPLETE = 1,
+    SOUND_DAY_COMPLETE  = 2,
+    SOUND_TIMER_ALARM   = 3,
+    SOUND_TIMER_STOP    = 4,
+} sound_event_t;
+
+static volatile bool s_alarm_active = false;
 
 static void amp_on(void)  { gpio_set_level(AMP_CTRL_PIN, 0); }
 static void amp_off(void) { gpio_set_level(AMP_CTRL_PIN, 1); }
@@ -126,6 +133,26 @@ static void sound_worker(void *arg) {
                 vTaskDelay(pdMS_TO_TICKS(25));
                 play_tone(1047, 250, 85);
                 break;
+            case SOUND_TIMER_ALARM:
+                if (s_alarm_active) {
+                    ESP_LOGI(TAG, ">>> TIMER ALARM beep");
+                    play_tone(987,  110, 80);
+                    vTaskDelay(pdMS_TO_TICKS(45));
+                    play_tone(1175, 110, 80);
+                    vTaskDelay(pdMS_TO_TICKS(45));
+                    play_tone(1568, 260, 90);
+                    vTaskDelay(pdMS_TO_TICKS(700));
+                    /* Re-enqueue to repeat while flag is set */
+                    if (s_alarm_active) {
+                        uint8_t ev2 = SOUND_TIMER_ALARM;
+                        xQueueSend(sound_queue, &ev2, 0);
+                    }
+                }
+                break;
+            case SOUND_TIMER_STOP:
+                s_alarm_active = false;
+                ESP_LOGI(TAG, ">>> TIMER ALARM stopped");
+                break;
             }
         }
     }
@@ -214,3 +241,13 @@ static void enqueue(uint8_t evt) {
 
 void sound_task_complete(void) { enqueue(SOUND_TASK_COMPLETE); }
 void sound_day_complete(void)  { enqueue(SOUND_DAY_COMPLETE); }
+
+void sound_timer_alarm(void) {
+    s_alarm_active = true;
+    enqueue(SOUND_TIMER_ALARM);
+}
+
+void sound_timer_stop(void) {
+    s_alarm_active = false;
+    enqueue(SOUND_TIMER_STOP);
+}

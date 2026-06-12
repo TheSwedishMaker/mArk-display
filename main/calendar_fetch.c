@@ -371,6 +371,36 @@ static void parse_challenge_tag(cal_task_t *ct) {
     memmove(tag_start, rest, strlen(rest) + 1);
 }
 
+/* ── Parse and strip [T] timer tag — duration from event DTEND-DTSTART ── */
+static void parse_timer_tag(cal_task_t *ct, uint32_t duration_sec) {
+    ct->timer_duration_sec = 0;
+    char *p = strstr(ct->title, "[T]");
+    if (!p || duration_sec == 0) return;
+    ct->timer_duration_sec = duration_sec;
+
+    /* Strip tag and surrounding spaces from display title */
+    char *tag_start = p;
+    while (tag_start > ct->title && *(tag_start - 1) == ' ') tag_start--;
+    char *rest = p + 3;
+    while (*rest == ' ') rest++;
+    memmove(tag_start, rest, strlen(rest) + 1);
+}
+
+/* ── Compute duration from Google Calendar ISO8601 datetimes ── */
+static uint32_t parse_google_duration_sec(const char *s_dt, const char *e_dt) {
+    int sy, sm, sd, sh, smi, ss;
+    int ey, em, ed, eh, emi, es;
+    if (sscanf(s_dt, "%d-%d-%dT%d:%d:%d", &sy, &sm, &sd, &sh, &smi, &ss) < 6) return 0;
+    if (sscanf(e_dt, "%d-%d-%dT%d:%d:%d", &ey, &em, &ed, &eh, &emi, &es) < 6) return 0;
+    struct tm t1 = {.tm_year=sy-1900,.tm_mon=sm-1,.tm_mday=sd,
+                    .tm_hour=sh,.tm_min=smi,.tm_sec=ss,.tm_isdst=-1};
+    struct tm t2 = {.tm_year=ey-1900,.tm_mon=em-1,.tm_mday=ed,
+                    .tm_hour=eh,.tm_min=emi,.tm_sec=es,.tm_isdst=-1};
+    time_t ts1 = mktime(&t1), ts2 = mktime(&t2);
+    if (ts1 < 0 || ts2 <= ts1) return 0;
+    return (uint32_t)(ts2 - ts1);
+}
+
 /* ── Parse ISO8601 time → "HH:MM" ── */
 static void parse_time(const char *iso, char *out, size_t len) {
     const char *t = strchr(iso, 'T');
@@ -492,6 +522,12 @@ static void ics_commit_event(const ics_event_t *event, time_t day_start, time_t 
     strncpy(ct->time, event->time[0] ? event->time : TR_ALL_DAY, sizeof(ct->time) - 1);
     ct->time[sizeof(ct->time) - 1] = '\0';
     parse_challenge_tag(ct);
+    uint32_t timer_dur = 0;
+    if (!event->all_day && event->has_start && event->has_end &&
+        event->end_ts > event->start_ts) {
+        timer_dur = (uint32_t)(event->end_ts - event->start_ts);
+    }
+    parse_timer_tag(ct, timer_dur);
     ct->completed = was_completed(ct);
     s_stage_count++;
 }
@@ -566,6 +602,17 @@ static bool fetch_google(const char *calendar_id, const char *time_min, const ch
                     MAX_TITLE_LEN - 1);
             ct->title[MAX_TITLE_LEN - 1] = '\0';
             parse_challenge_tag(ct);
+
+            cJSON *end = cJSON_GetObjectItem(item, "end");
+            uint32_t google_dur = 0;
+            if (start && end) {
+                cJSON *s_dt = cJSON_GetObjectItem(start, "dateTime");
+                cJSON *e_dt = cJSON_GetObjectItem(end, "dateTime");
+                if (cJSON_IsString(s_dt) && cJSON_IsString(e_dt)) {
+                    google_dur = parse_google_duration_sec(s_dt->valuestring, e_dt->valuestring);
+                }
+            }
+            parse_timer_tag(ct, google_dur);
 
             if (start) {
                 cJSON *dt = cJSON_GetObjectItem(start, "dateTime");
