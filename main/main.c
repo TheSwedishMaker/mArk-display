@@ -161,24 +161,35 @@ static void encoder_task(void *arg) {
             ESP_LOGI(TAG, "ENC heartbeat: A=%d B=%d BTN=%d", a, b, btn);
         }
 
-        /* Rotation: scroll tasks */
+        /* Rotation: wake display if sleeping, otherwise scroll tasks.
+         * ui_wake_display() acquires the LVGL lock internally, so it must NOT
+         * be called while we hold the lock — check sleep state first, then branch. */
         int rot = encoder_poll();
-        if (rot != 0 && !ui_is_complete_shown()) {
-            if (lvgl_port_lock(100)) {
-                if (rot > 0) ui_next_task();
-                else ui_prev_task();
-                lvgl_port_unlock();
+        if (rot != 0) {
+            if (ui_is_sleeping()) {
+                ui_wake_display();          /* acquires LVGL lock internally */
+                power_button_force_wake();  /* turns on backlight, syncs power button */
+            } else if (!ui_is_complete_shown()) {
+                if (lvgl_port_lock(100)) {
+                    if (rot > 0) ui_next_task();
+                    else ui_prev_task();
+                    lvgl_port_unlock();
+                }
             }
         }
 
-        /* Push button: toggle complete on current task (works even on complete screen) */
+        /* Push button: wake display if sleeping, otherwise toggle complete / dismiss */
         bool btn_pressed = encoder_button_pressed();
         if (btn_pressed && !btn_was_pressed) {
             static uint32_t btn_last_ms = 0;
             uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if ((now_ms - btn_last_ms) >= 400) {   /* 400ms debounce — kills contact bounce */
+            if ((now_ms - btn_last_ms) >= 400) {   /* 400ms debounce */
                 bool handled = false;
-                if (ui_is_complete_shown()) {
+                if (ui_is_sleeping()) {
+                    ui_wake_display();
+                    power_button_force_wake();
+                    handled = true;
+                } else if (ui_is_complete_shown()) {
                     if (lvgl_port_lock(100)) {
                         ui_dismiss_complete();
                         lvgl_port_unlock();

@@ -15,3 +15,11 @@ dependencies.lock
 
 # VS Code
 .vscode/
+
+# Elecrow driver repo and build scaffolding (local only — see README for setup)
+elecrow-examples/
+esp32-project/
+peripheral/peripheral/
+
+# Backup files
+*.bak

@@ -1,14 +1,25 @@
+/**
+ * Timer engine — hardware-independent countdown driven by esp_timer.
+ *
+ * esp_timer callbacks run in the esp_timer_task context, which is separate
+ * from the LVGL task. All LVGL object manipulation must happen while holding
+ * the LVGL port mutex. Rather than locking from within the timer callback
+ * (which could deadlock or cause priority inversion), we use lv_async_call()
+ * to post the expiry handler onto the LVGL task's event queue. It will be
+ * called from inside lv_task_handler(), which already holds the lock.
+ */
 #include "timer_engine.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include <string.h>
 
-static const char *TAG = "TIMER_ENG";
+static const char *TAG = "TIMER";
 
-static timer_state_t    s_state  = {0};
-static esp_timer_handle_t s_htimer = NULL;
-static lv_async_cb_t    s_expiry_cb = NULL;
+static timer_state_t      s_state    = {0};
+static esp_timer_handle_t s_htimer   = NULL;
+static lv_async_cb_t      s_expiry_cb = NULL;
 
+/* Called every 1 second from esp_timer_task — not the LVGL task. */
 static void timer_tick_cb(void *arg) {
     (void)arg;
     if (!s_state.active || s_state.paused) return;
@@ -18,6 +29,7 @@ static void timer_tick_cb(void *arg) {
         s_state.active  = false;
         s_state.expired = true;
         ESP_LOGI(TAG, "Expired: task=%d user=%d", s_state.task_idx, s_state.user_idx);
+        /* Queue the UI handler to run safely in the LVGL task (see file comment) */
         if (s_expiry_cb) lv_async_call(s_expiry_cb, NULL);
     }
 }

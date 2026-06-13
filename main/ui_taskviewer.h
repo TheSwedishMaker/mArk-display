@@ -11,6 +11,7 @@ void ui_refresh_clock(void);
 void ui_next_task(void);
 void ui_prev_task(void);
 bool ui_is_complete_shown(void);
+bool ui_is_sleeping(void);
 void ui_complete_current_task(void);
 void ui_dismiss_complete(void);
 /* Re-apply current progress to LEDs — safe to call from any task (no LVGL) */

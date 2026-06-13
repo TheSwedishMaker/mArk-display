@@ -168,9 +168,10 @@ static void refresh_progress(void);
 static void refresh_dots(void);
 static void refresh_sidebar(void);
 static void show_complete_screen(void);
+static void hide_complete_screen(void);
 static void user_bar_refresh(void);
 static void show_leaderboard(void);
-static void hide_complete_screen(void);
+static void hide_leaderboard(void);
 static void cb_clock_tick(lv_timer_t *t);
 static void close_timer_popup(void);
 static void show_timer_popup(void);
@@ -250,9 +251,6 @@ static void cb_gesture(lv_event_t *e) {
 }
 
 /* Dark mode toggle — rebuild entire UI with new theme */
-static void show_leaderboard(void);
-static void hide_leaderboard(void);
-
 static void cb_toggle_dark(lv_event_t *e) {
     (void)e;
     ui_dark_mode = !ui_dark_mode;
@@ -363,7 +361,21 @@ static void cb_sleep_display(lv_event_t *e) {
     ws2812_off();
 }
 
-/* ── On-screen keyboard ── */
+/* ── On-screen keyboard ─────────────────────────────────────────────────────
+ * A full QWERTY layout with Swedish characters (å ä ö). Three modes:
+ *   mode=0  lowercase     mode=1  uppercase     mode=2  numeric/symbols
+ * Special key codes (control characters in the key string):
+ *   \x01 = shift toggle   \x02 = backspace   \x03 = switch to 123
+ *   \x04 = submit/done    \x05 = switch to abc
+ *
+ * The keyboard replaces the main screen with a full-screen overlay. When used
+ * from settings (to type a URL or user name), kb_on_submit is set to a custom
+ * callback; when adding a quick local task it is left NULL.
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define KB_PAD    16   /* inner padding within the keyboard panel */
+#define KB_GAP     5   /* gap between keys */
+#define KB_TOP_H  88   /* height reserved for close button + input field */
+
 static void show_keyboard(void);
 static void hide_keyboard(void);
 
@@ -550,10 +562,6 @@ static void show_keyboard(void) {
     lv_obj_set_style_radius(kb_panel, BEZEL_INNER_R, 0);
     lv_obj_clear_flag(kb_panel, LV_OBJ_FLAG_SCROLLABLE);
 
-    #define KB_PAD   16   /* inner padding within panel */
-    #define KB_GAP    5
-    #define KB_TOP_H 88   /* reserved height for close btn + input (pad + 60px + gap) */
-
     /* Close button — top-left of inner panel, fully visible below bezel */
     lv_obj_t *btn_close = lv_btn_create(kb_panel);
     lv_obj_set_size(btn_close, 52, 60);
@@ -679,7 +687,20 @@ static void hide_keyboard(void) {
     ui_showing_keyboard = false;
 }
 
-/* ── Settings overlay — two-level: User List → Source Editor ── */
+/* ── Settings overlay ────────────────────────────────────────────────────────
+ * Two-level navigation:
+ *   Level 1: User list — one row per user with rename/remove buttons.
+ *            If only one user exists, this level is skipped entirely.
+ *   Level 2: Source editor — list of cal_source_t entries for that user,
+ *            with enable/disable checkbox and add/remove controls.
+ *
+ * The overlay shell is created by settings_ensure_overlay() and reused between
+ * the two levels. Popping from Level 2 back to Level 1 just calls
+ * settings_populate_user_list() without recreating the shell.
+ *
+ * The keyboard flow temporarily destroys the overlay (to use the full screen),
+ * and settings_ensure_overlay() is idempotent so it can recreate it safely.
+ * ─────────────────────────────────────────────────────────────────────────── */
 static cal_source_t settings_temp_sources[MAX_CAL_SOURCES];
 static int settings_temp_count = 0;
 static lv_obj_t *settings_list_container = NULL;
@@ -725,23 +746,41 @@ static void cb_settings_remove_user(lv_event_t *e) {
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (user_count <= 1) return;
 
-    /* If removing the active user, switch to another user first */
-    if (idx == active_user) {
+    bool was_active = (idx == active_user);
+    if (was_active) {
+        /* Switch to the nearest other user (prefer lower index so we don't land out-of-bounds) */
+        int new_active = (idx > 0) ? idx - 1 : 1;
         calendar_save_completion_state();
-        active_user = (idx == 0) ? 1 : 0;
+        active_user = new_active;
         calendar_sources_load_user(active_user);
         streak_set_active_user(active_user);
         challenge_set_active_user(active_user);
+        if (!calendar_restore_cached_tasks(active_user)) {
+            calendar_set_offline_placeholder();
+        }
+        calendar_save_completion_state();
         calendar_suppress_next_completion_save();
-        calendar_fetch();
-        ui_refresh_all();
     }
+
     user_store_remove(idx);
-    streak_shift_down(idx, user_count);      /* keep streak NVS indices in sync */
-    challenge_shift_down(idx, user_count);   /* keep challenge NVS indices in sync */
-    streak_set_active_user(active_user);     /* re-sync in-memory state to new indices */
+    streak_shift_down(idx, user_count);
+    challenge_shift_down(idx, user_count);
+
+    /* Indices above the removed slot shift down by 1 after removal */
+    if (idx < active_user) {
+        active_user--;
+    }
+
+    streak_set_active_user(active_user);
     challenge_set_active_user(active_user);
     user_store_save();
+
+    if (was_active) {
+        ui_current = 0;
+        ui_completed = calendar_get_completed();
+        calendar_request_refresh();
+        ui_refresh_all();
+    }
     settings_populate_user_list();
 }
 
@@ -1474,9 +1513,16 @@ static void show_timer_popup(void) {
     s_timer_popup_lv_timer = lv_timer_create(cb_timer_popup_tick, 250, NULL);
 }
 
-/* "Already running" toast — auto-dismisses after 3 s, no click handler.
- * Using a static pointer prevents double-create and the use-after-free crash
- * that a click handler + pending lv_timer would otherwise cause. */
+/* "Already running" toast — auto-dismisses after 3 s.
+ *
+ * Design decisions:
+ *   1. No click-to-dismiss handler: if we added one, a click would delete the
+ *      overlay while the pending lv_timer still holds a raw pointer to it,
+ *      causing a use-after-free crash when the timer fires later.
+ *   2. s_busy_popup static pointer + dismiss-previous-before-create: prevents
+ *      multiple overlapping toasts if the user taps the button rapidly.
+ *   3. lv_timer_set_repeat_count(tmr, 1): LVGL auto-deletes the timer after
+ *      one fire, so the callback must NOT also call lv_timer_del(t). */
 static void cb_busy_popup_autodismiss(lv_timer_t *t) {
     (void)t;  /* lv_timer_set_repeat_count(1) auto-deletes t after this returns */
     if (s_busy_popup) {
@@ -1546,21 +1592,27 @@ static void cb_timer_btn(lv_event_t *e) {
     show_timer_popup();
 }
 
-/* Called via lv_async_call when the esp_timer fires expiry — runs in LVGL context */
+/* Called via lv_async_call when the esp_timer tick fires — runs inside
+ * lv_task_handler() which already holds the LVGL port mutex.
+ *
+ * Important: do NOT call ui_wake_display() here. That function tries to
+ * acquire the LVGL lock via lvgl_port_lock(), which would deadlock because
+ * we are already inside the lock. Instead, manipulate sleep_overlay directly
+ * (safe, we hold the lock) and call power_button_force_wake() for the
+ * backlight and power_button state (safe, it never touches LVGL objects).
+ */
 static void on_timer_expired(void *arg) {
     (void)arg;
     const timer_state_t *ts = timer_engine_get_state();
 
-    /* Wake display if it was sleeping — we hold the LVGL lock here so delete
-     * sleep_overlay directly instead of calling ui_wake_display() which would
-     * try to re-acquire the already-held lock. */
+    /* Wake display if it was sleeping */
     if (display_sleeping) {
         if (sleep_overlay) {
             lv_obj_del(sleep_overlay);
             sleep_overlay = NULL;
         }
         display_sleeping = false;
-        power_button_force_wake();  /* turns on backlight, syncs power button state */
+        power_button_force_wake();  /* turns on backlight, syncs power button's display_on */
     }
 
     /* Switch user if timer was running for a different user */
@@ -1873,14 +1925,15 @@ static void user_bar_refresh(void) {
     }
 }
 
-/* ── Leaderboard overlay ── */
-
-/* ── Leaderboard tap-reset gestures ──
- *   5 taps  in 2 s → reset streak
- *  10 taps  in 2 s → reset all medals (parent override)
- * The counter persists across overlay rebuilds (static arrays), so the user
- * can streak-reset at 5 and then continue tapping to 10 for medal reset.
- */
+/* ── Leaderboard overlay ─────────────────────────────────────────────────────
+ * Tap-reset gestures for parent/admin override (hidden feature):
+ *   5 taps on a user row within 2 s → reset that user's streak to 0
+ *  10 taps on a user row within 2 s → also reset all of that user's medals
+ *
+ * The tap counter is in a static array so it persists across overlay rebuilds.
+ * The user can streak-reset at tap 5, then continue tapping toward 10 without
+ * resetting the window.
+ * ─────────────────────────────────────────────────────────────────────────── */
 #define LB_STREAK_RESET_TAPS  5
 #define LB_MEDAL_RESET_TAPS  10
 #define LB_RESET_WINDOW_MS   2000
@@ -2075,36 +2128,38 @@ static void cb_open_leaderboard(lv_event_t *e) {
     show_leaderboard();
 }
 
+/* Switch the active user. Order matters for completion state integrity:
+ *   1. Save outgoing user's completion keys before active_user changes.
+ *   2. Switch active_user, load new user's sources/streak/challenge.
+ *   3. Restore cached tasks immediately so the UI doesn't show a blank screen.
+ *   4. Seed the new user's completion keys from the just-restored cache so
+ *      the background fetch's was_completed() checks use the right state.
+ *   5. Request a background network refresh; suppress the completion save that
+ *      calendar_fetch() would normally do so we don't clobber the slot we
+ *      just seeded in step 4. */
 static void cb_switch_user(lv_event_t *e) {
     int new_idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (new_idx == active_user || new_idx >= user_count) return;
 
-    /* Save outgoing user's completion state and calendar sources before switching */
     calendar_save_completion_state();
     calendar_sources_save_user(active_user);
 
-    /* Switch active user and persist */
     active_user = new_idx;
     user_store_save();
 
-    /* Load the new user's data */
     calendar_sources_load_user(active_user);
     streak_set_active_user(active_user);
     challenge_set_active_user(active_user);
 
-    /* Restore cached tasks instantly — falls back to placeholder if never fetched before */
     if (!calendar_restore_cached_tasks(active_user)) {
         calendar_set_offline_placeholder();
     }
-    /* Sync s_completed_keys for new user from whatever cal_tasks[] now holds,
-     * so the background network fetch's was_completed() calls use correct state. */
     calendar_save_completion_state();
 
     ui_completed = calendar_get_completed();
     ui_current = 0;
     ui_refresh_all();
 
-    /* Refresh from network in background — suppress save to preserve completion slot */
     calendar_suppress_next_completion_save();
     calendar_request_refresh();
 }
@@ -2202,9 +2257,9 @@ static void rebuild_user_bar(void) {
 void ui_build(void) {
     lv_obj_t *scr = lv_scr_act();
 
-    /* Prevent the root screen from scrolling — otherwise a slight finger drag
-     * in the sidebar triggers LVGL's scroll-chain and the whole screen shifts,
-     * swallowing click events (CLICKED never fires on the button). */
+    /* LVGL 9 propagates scroll events up the parent chain by default. Without
+     * these flags a finger drag anywhere will scroll the root screen, shifting
+     * all children and swallowing the subsequent CLICKED event on buttons. */
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
@@ -2212,7 +2267,10 @@ void ui_build(void) {
     lv_obj_set_style_bg_color(scr, th_bg(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    /* Full-screen black base — renders as the bezel, sits below all panels */
+    /* Bezel simulation: a full-screen black rectangle sits behind all panels.
+     * The physical display opening is slightly smaller than 1024×600, so the
+     * black edges show through as a natural-looking bezel border. No clipping
+     * masks needed — the panels are positioned to fit inside the opening. */
     lv_obj_t *bezel_base = lv_obj_create(scr);
     lv_obj_remove_style_all(bezel_base);
     lv_obj_set_size(bezel_base, SCREEN_W, SCREEN_H);
@@ -2667,6 +2725,7 @@ void ui_refresh_all(void) {
 void ui_next_task(void) { cb_next(NULL); }
 void ui_prev_task(void) { cb_prev(NULL); }
 bool ui_is_complete_shown(void) { return ui_showing_complete || ui_showing_keyboard || ui_showing_settings; }
+bool ui_is_sleeping(void) { return display_sleeping; }
 void ui_complete_current_task(void) { cb_complete(NULL); }
 void ui_dismiss_complete(void) { hide_complete_screen(); }
 

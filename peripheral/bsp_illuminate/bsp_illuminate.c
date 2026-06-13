@@ -212,18 +212,19 @@ static esp_err_t lvgl_init()  // Initialize LVGL
     my_lvgl_disp = lvgl_port_add_disp_dsi(&disp_cfg, &lvgl_dpi_cfg);  // Add LVGL display
     if (my_lvgl_disp == NULL)
     {
-        err = ESP_FAIL;
         ILLUMINATE_ERROR("LVGL dsi port add fail");
+        return ESP_FAIL;
     }
-    const lvgl_port_touch_cfg_t touch_cfg = {
-        .disp = my_lvgl_disp,
-        .handle = tp,
-    };
-    my_touch_indev = lvgl_port_add_touch(&touch_cfg);
-    if (my_touch_indev == NULL)
-    {
-        err = ESP_FAIL;
-        DISPLAY_ERROR("LVGL touch port add fail");
+    if (tp != NULL) {
+        const lvgl_port_touch_cfg_t touch_cfg = {
+            .disp = my_lvgl_disp,
+            .handle = tp,
+        };
+        my_touch_indev = lvgl_port_add_touch(&touch_cfg);
+        if (my_touch_indev == NULL)
+        {
+            DISPLAY_ERROR("LVGL touch port add fail");
+        }
     }
     return err;
 }

@@ -30,6 +30,7 @@ static const char *TAG = "CAL";
 
 #define NTP_SERVER     "pool.ntp.org"
 #define NVS_NAMESPACE  "cal_cfg"
+#define SECS_PER_DAY   86400
 
 /* ── State ── */
 cal_task_t cal_tasks[MAX_TASKS];
@@ -64,7 +65,9 @@ static comp_key_t s_completed_keys[MAX_USERS][MAX_COMPLETED_KEYS];
 static int        s_completed_count[MAX_USERS];
 static char       s_completed_date[MAX_USERS][9];  /* YYYYMMDD the keys were saved for */
 
-/* When set, the next calendar_fetch() skips the internal save (used on user switch) */
+/* When set, the next calendar_fetch() skips the completion-state save.
+ * Use case: user switch — the new user's slot was just seeded from the cache;
+ * calendar_fetch() must not clobber it. Reset unconditionally at fetch start. */
 static bool s_suppress_completion_save = false;
 
 /* Snapshot of active_user taken at the start of calendar_fetch() — prevents
@@ -72,7 +75,6 @@ static bool s_suppress_completion_save = false;
 static int s_fetch_user = 0;
 
 /* ── Manual tasks (NVS-backed, editable from web UI) — per user ── */
-#define MANUAL_TASK_MAX 20
 
 static void manual_ns_for_user(int idx, char *buf, size_t len) {
     snprintf(buf, len, "u%d_tsk", idx);
@@ -84,7 +86,7 @@ static void manual_tasks_save_key(int user_idx, const char *key, const cal_task_
     manual_ns_for_user(user_idx, ns, sizeof(ns));
     nvs_handle_t h;
     if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return;
-    if (count > MANUAL_TASK_MAX) count = MANUAL_TASK_MAX;
+    if (count > MAX_TASKS) count = MAX_TASKS;
 
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < count; i++) {
@@ -177,7 +179,7 @@ static void save_completion_state(void) {
 
     /* Tag the saved state with today's date (adjusted for day offset) */
     time_t now = time(NULL);
-    now += cal_day_offset * 86400;
+    now += cal_day_offset * SECS_PER_DAY;
     struct tm td;
     localtime_r(&now, &td);
     snprintf(s_completed_date[u], sizeof(s_completed_date[u]), "%04d%02d%02d",
@@ -204,7 +206,7 @@ static bool was_completed(const cal_task_t *task) {
     /* Reject keys saved for a different day — prevents yesterday's completions
      * bleeding into today after midnight rollover */
     time_t now = time(NULL);
-    now += cal_day_offset * 86400;
+    now += cal_day_offset * SECS_PER_DAY;
     struct tm td;
     localtime_r(&now, &td);
     char fetch_date[9];
@@ -312,19 +314,26 @@ bool wifi_init_and_connect(void) {
 
 bool wifi_is_connected(void) { return s_wifi_connected; }
 
-/* ── HTTP response buffer (for Google Calendar JSON) ── */
-#define HTTP_BUF_SIZE 16384
-static char http_buf[HTTP_BUF_SIZE];
-static int  http_buf_len = 0;
+/* ── HTTP response buffer — used only by the Google Calendar JSON path ── */
+#define GOOGLE_JSON_BUF_SIZE 32768
+static char google_json_buf[GOOGLE_JSON_BUF_SIZE];
+static int  google_json_buf_len = 0;
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     switch (evt->event_id) {
-    case HTTP_EVENT_ON_DATA:
-        if (http_buf_len + evt->data_len < HTTP_BUF_SIZE - 1) {
-            memcpy(http_buf + http_buf_len, evt->data, evt->data_len);
-            http_buf_len += evt->data_len;
+    case HTTP_EVENT_ON_DATA: {
+        int space = GOOGLE_JSON_BUF_SIZE - 1 - google_json_buf_len;
+        if (space > 0) {
+            int copy_len = evt->data_len < space ? evt->data_len : space;
+            memcpy(google_json_buf + google_json_buf_len, evt->data, copy_len);
+            google_json_buf_len += copy_len;
+            if (copy_len < evt->data_len) {
+                ESP_LOGW(TAG, "Google JSON buffer full — response truncated (%d bytes dropped)",
+                         evt->data_len - copy_len);
+            }
         }
         break;
+    }
     default:
         break;
     }
@@ -405,7 +414,7 @@ static uint32_t parse_google_duration_sec(const char *s_dt, const char *e_dt) {
 static void parse_time(const char *iso, char *out, size_t len) {
     const char *t = strchr(iso, 'T');
     if (t && strlen(t) >= 6) {
-        snprintf(out, len, "%.5s", t + 1);
+        snprintf(out, len, "%c%c:%c%c", t[1], t[2], t[4], t[5]);
     } else {
         snprintf(out, len, TR_ALL_DAY);
     }
@@ -420,10 +429,42 @@ typedef struct {
     bool has_end;
     time_t start_ts;
     time_t end_ts;
+    /* RRULE: recurrence rule — DAILY, WEEKLY, MONTHLY, and YEARLY are handled */
+    bool    rrule_daily;
+    bool    rrule_weekly;
+    bool    rrule_monthly;   /* FREQ=MONTHLY: recurs on same day-of-month */
+    bool    rrule_yearly;    /* FREQ=YEARLY: recurs on same month+day */
+    int     rrule_interval;  /* repeat every Nth period; 0 or 1 means every occurrence */
+    uint8_t rrule_byday;     /* WEEKLY BYDAY bitmask: bit 0=SU,1=MO,...,6=SA; 0 = use DTSTART weekday */
+    time_t  rrule_until;     /* UNTIL timestamp, 0 = no limit */
+    /* EXDATE: up to 8 excluded occurrence timestamps */
+#define ICS_MAX_EXDATES 8
+    time_t  exdates[ICS_MAX_EXDATES];
+    int     exdate_count;
 } ics_event_t;
 
 static void ics_reset_event(ics_event_t *event) {
     memset(event, 0, sizeof(*event));
+}
+
+/* Convert a UTC struct tm to time_t without touching the TZ environment.
+ * Equivalent to the non-standard timegm(); ESP-IDF's newlib does not guarantee it. */
+static time_t utc_mktime(const struct tm *t) {
+    static const int days_before_month[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    int y    = t->tm_year + 1900;
+    int m    = t->tm_mon;
+    bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+    long days = (long)(y - 1970) * 365
+              + (y - 1969) / 4
+              - (y - 1901) / 100
+              + (y - 1601) / 400
+              + days_before_month[m]
+              + (m > 1 && leap ? 1 : 0)
+              + (t->tm_mday - 1);
+    return (time_t)(days * (long)SECS_PER_DAY
+                    + t->tm_hour * 3600L
+                    + t->tm_min  * 60L
+                    + t->tm_sec);
 }
 
 static bool ics_parse_datetime(const char *value, bool *all_day, time_t *out_ts, char *out_time, size_t out_time_len) {
@@ -468,20 +509,7 @@ static bool ics_parse_datetime(const char *value, bool *all_day, time_t *out_ts,
     tm_val.tm_sec = second;
 
     if (is_utc) {
-        /* Convert UTC struct tm to time_t using timegm equivalent */
-        /* Save/restore TZ to get UTC mktime */
-        char *old_tz = getenv("TZ");
-        char saved_tz[64] = {0};
-        if (old_tz) {
-            strncpy(saved_tz, old_tz, sizeof(saved_tz) - 1);
-            saved_tz[sizeof(saved_tz) - 1] = '\0';
-        }
-        setenv("TZ", "UTC0", 1);
-        tzset();
-        *out_ts = mktime(&tm_val);
-        if (old_tz) setenv("TZ", saved_tz, 1);
-        else unsetenv("TZ");
-        tzset();
+        *out_ts = utc_mktime(&tm_val);
         /* Convert UTC hour/minute to local for display */
         struct tm local_tm;
         localtime_r(out_ts, &local_tm);
@@ -500,19 +528,114 @@ static bool ics_parse_datetime(const char *value, bool *all_day, time_t *out_ts,
 
 static bool ics_event_matches_day(const ics_event_t *event, time_t day_start, time_t day_end) {
     if (!event->has_start) return false;
-
     time_t event_end = event->has_end ? event->end_ts : event->start_ts + 60;
-    if (event->all_day && event->has_end && event_end > event->start_ts) {
-        return event->start_ts < day_end && event_end > day_start;
-    }
-
     return event->start_ts < day_end && event_end > day_start;
 }
 
 static void ics_commit_event(const ics_event_t *event, time_t day_start, time_t day_end) {
     if (s_stage_count >= MAX_TASKS) return;
-    if (!ics_event_matches_day(event, day_start, day_end)) return;
     if (event->summary[0] == '\0') return;
+
+    int interval   = (event->rrule_interval > 1) ? event->rrule_interval : 1;
+    bool is_recurring = event->rrule_daily || event->rrule_weekly
+                     || event->rrule_monthly || event->rrule_yearly;
+
+    ics_event_t adj = *event;
+
+    if (is_recurring && event->has_start && event->start_ts < day_start) {
+        /* Series expired — UNTIL is before today */
+        if (event->rrule_until > 0 && event->rrule_until < day_start) {
+            return;
+        }
+
+        struct tm orig_tm, day_tm;
+        localtime_r(&event->start_ts, &orig_tm);
+        localtime_r(&day_start, &day_tm);
+
+        bool skip = false;
+
+        if (event->rrule_daily) {
+            /* Use local-day boundaries for the diff to handle DST correctly */
+            struct tm orig_day = orig_tm;
+            orig_day.tm_hour = 0; orig_day.tm_min = 0; orig_day.tm_sec = 0; orig_day.tm_isdst = -1;
+            int day_diff = (int)((day_start - mktime(&orig_day)) / SECS_PER_DAY);
+            if (day_diff < 0 || day_diff % interval != 0) skip = true;
+
+        } else if (event->rrule_weekly) {
+            uint8_t byday = event->rrule_byday;
+            if (byday != 0) {
+                if (!(byday & (uint8_t)(1u << day_tm.tm_wday))) skip = true;
+            } else {
+                if (orig_tm.tm_wday != day_tm.tm_wday) skip = true;
+            }
+            if (!skip && interval > 1) {
+                struct tm orig_day = orig_tm;
+                orig_day.tm_hour = 0; orig_day.tm_min = 0; orig_day.tm_sec = 0; orig_day.tm_isdst = -1;
+                int day_diff = (int)((day_start - mktime(&orig_day)) / SECS_PER_DAY);
+                if (day_diff < 0 || (day_diff / 7) % interval != 0) skip = true;
+            }
+
+        } else if (event->rrule_monthly) {
+            if (day_tm.tm_mday != orig_tm.tm_mday) {
+                skip = true;
+            } else {
+                int month_diff = (day_tm.tm_year - orig_tm.tm_year) * 12
+                               + (day_tm.tm_mon  - orig_tm.tm_mon);
+                if (month_diff < 0 || month_diff % interval != 0) skip = true;
+            }
+
+        } else if (event->rrule_yearly) {
+            if (day_tm.tm_mon != orig_tm.tm_mon || day_tm.tm_mday != orig_tm.tm_mday) {
+                skip = true;
+            } else {
+                int year_diff = day_tm.tm_year - orig_tm.tm_year;
+                if (year_diff < 0 || year_diff % interval != 0) skip = true;
+            }
+        }
+
+        if (skip) {
+            ESP_LOGI(TAG, "  ICS wrong-day: \"%s\" @ %04d-%02d-%02d %s",
+                     event->summary, orig_tm.tm_year+1900, orig_tm.tm_mon+1, orig_tm.tm_mday,
+                     event->time);
+            return;
+        }
+
+        /* Project occurrence time-of-day onto the target date */
+        struct tm occ = orig_tm;
+        occ.tm_year  = day_tm.tm_year;
+        occ.tm_mon   = day_tm.tm_mon;
+        occ.tm_mday  = day_tm.tm_mday;
+        occ.tm_isdst = -1;
+        adj.start_ts = mktime(&occ);
+        if (event->has_end && event->end_ts > event->start_ts) {
+            adj.end_ts = adj.start_ts + (event->end_ts - event->start_ts);
+        }
+    }
+
+    if (!ics_event_matches_day(&adj, day_start, day_end)) {
+        struct tm t;
+        localtime_r(&event->start_ts, &t);
+        ESP_LOGI(TAG, "  ICS wrong-day: \"%s\" @ %04d-%02d-%02d %s",
+                 event->summary, t.tm_year+1900, t.tm_mon+1, t.tm_mday, event->time);
+        return;
+    }
+
+    /* Skip if this occurrence's local date matches an EXDATE entry.
+     * Compare by date only — EXDATE timestamps may differ by timezone offset. */
+    {
+        struct tm adj_tm;
+        localtime_r(&adj.start_ts, &adj_tm);
+        for (int i = 0; i < event->exdate_count; i++) {
+            struct tm ex_tm;
+            localtime_r(&event->exdates[i], &ex_tm);
+            if (adj_tm.tm_year == ex_tm.tm_year &&
+                adj_tm.tm_mon  == ex_tm.tm_mon  &&
+                adj_tm.tm_mday == ex_tm.tm_mday) {
+                ESP_LOGI(TAG, "  ICS excluded (EXDATE): \"%s\" @ %s", event->summary, event->time);
+                return;
+            }
+        }
+    }
 
     cal_task_t *ct = &s_stage[s_stage_count];
     strncpy(ct->id, event->uid[0] ? event->uid : "ics-event", sizeof(ct->id) - 1);
@@ -556,8 +679,8 @@ static bool fetch_google(const char *calendar_id, const char *time_min, const ch
 
     ESP_LOGI(TAG, "Google fetch: %s", url);
 
-    http_buf_len = 0;
-    memset(http_buf, 0, sizeof(http_buf));
+    google_json_buf_len = 0;
+    memset(google_json_buf, 0, sizeof(google_json_buf));
 
     esp_http_client_config_t config = {
         .url = url,
@@ -575,15 +698,20 @@ static bool fetch_google(const char *calendar_id, const char *time_min, const ch
         return false;
     }
 
-    http_buf[http_buf_len] = '\0';
+    google_json_buf[google_json_buf_len] = '\0';
+    ESP_LOGI(TAG, "Google response: %d bytes", google_json_buf_len);
 
-    cJSON *doc = cJSON_Parse(http_buf);
+    cJSON *doc = cJSON_Parse(google_json_buf);
     if (!doc) {
-        ESP_LOGE(TAG, "Google JSON parse error");
+        ESP_LOGE(TAG, "Google JSON parse error (buf_len=%d, buf_full=%s)",
+                 google_json_buf_len, google_json_buf_len >= GOOGLE_JSON_BUF_SIZE - 2 ? "YES" : "no");
         return false;
     }
 
     cJSON *items = cJSON_GetObjectItem(doc, "items");
+    int item_count = cJSON_IsArray(items) ? cJSON_GetArraySize(items) : 0;
+    ESP_LOGI(TAG, "Google items in response: %d", item_count);
+
     if (cJSON_IsArray(items)) {
         cJSON *item;
         cJSON_ArrayForEach(item, items) {
@@ -624,6 +752,7 @@ static bool fetch_google(const char *calendar_id, const char *time_min, const ch
             }
 
             ct->completed = was_completed(ct);
+            ESP_LOGI(TAG, "  staged[%d]: \"%s\" @ %s", s_stage_count, ct->title, ct->time);
             s_stage_count++;
         }
     }
@@ -636,27 +765,25 @@ static bool fetch_google(const char *calendar_id, const char *time_min, const ch
 #define ICS_LINE_MAX 512
 
 typedef struct {
-    /* Line accumulation (handles folded lines) */
     char line_buf[ICS_LINE_MAX];
     int  line_len;
-    bool prev_cr;          /* last char was \r */
+    bool line_pending;   /* line_buf holds a complete unprocessed line;
+                          * set on \n, cleared when the next non-continuation char arrives */
 
-    /* Event state */
     bool in_event;
-    bool skip_event;       /* true if DTSTART is outside ±2 day window */
+    bool cancelled;      /* STATUS:CANCELLED was seen in this VEVENT */
     ics_event_t current_event;
 
-    /* Target day */
     time_t day_start;
     time_t day_end;
     int    added;
+    int    total_vevents;
 } ics_stream_t;
 
 static ics_stream_t *s_ics_ctx = NULL;
 
 static void ics_process_line(ics_stream_t *ctx) {
     char *line = ctx->line_buf;
-    /* Remove trailing \r */
     int len = ctx->line_len;
     while (len > 0 && (line[len-1] == '\r' || line[len-1] == '\n'))
         line[--len] = '\0';
@@ -666,16 +793,25 @@ static void ics_process_line(ics_stream_t *ctx) {
 
     if (strncmp(line, "BEGIN:VEVENT", 12) == 0) {
         ctx->in_event = true;
-        ctx->skip_event = false;
+        ctx->cancelled = false;
+        ctx->total_vevents++;
         ics_reset_event(&ctx->current_event);
+    } else if (ctx->in_event && strncmp(line, "STATUS:CANCELLED", 16) == 0) {
+        ctx->cancelled = true;
     } else if (strncmp(line, "END:VEVENT", 10) == 0) {
-        if (ctx->in_event && !ctx->skip_event && s_stage_count < MAX_TASKS) {
+        if (ctx->in_event && !ctx->cancelled && s_stage_count < MAX_TASKS) {
+            int before = s_stage_count;
             ics_commit_event(&ctx->current_event, ctx->day_start, ctx->day_end);
-            ctx->added++;
+            if (s_stage_count > before) {
+                ESP_LOGI(TAG, "  ICS staged: \"%s\" @ %s", ctx->current_event.summary, ctx->current_event.time);
+                ctx->added++;
+            }
+        } else if (ctx->in_event && ctx->cancelled) {
+            ESP_LOGI(TAG, "  ICS skipped: \"%s\" (cancelled)", ctx->current_event.summary);
         }
         ctx->in_event = false;
-        ctx->skip_event = false;
-    } else if (ctx->in_event && !ctx->skip_event) {
+        ctx->cancelled = false;
+    } else if (ctx->in_event && !ctx->cancelled) {
         char *val = strchr(line, ':');
         if (val) {
             *val++ = '\0';
@@ -688,28 +824,63 @@ static void ics_process_line(ics_stream_t *ctx) {
                     ctx->current_event.time,
                     sizeof(ctx->current_event.time)
                 );
-                /* Skip events that ended more than 1 day before target window */
-                if (ctx->current_event.has_start &&
-                    ctx->current_event.start_ts < (ctx->day_start - 86400)) {
-                    ctx->skip_event = true;
-                }
-            } else if (!ctx->skip_event && strncmp(line, "SUMMARY", 7) == 0 && (line[7] == '\0' || line[7] == ';')) {
+            } else if (strncmp(line, "SUMMARY", 7) == 0 && (line[7] == '\0' || line[7] == ';')) {
                 strncpy(ctx->current_event.summary, val, MAX_TITLE_LEN - 1);
                 ctx->current_event.summary[MAX_TITLE_LEN - 1] = '\0';
-            } else if (!ctx->skip_event && strncmp(line, "UID", 3) == 0 && (line[3] == '\0' || line[3] == ';')) {
+            } else if (strncmp(line, "UID", 3) == 0 && (line[3] == '\0' || line[3] == ';')) {
                 strncpy(ctx->current_event.uid, val, sizeof(ctx->current_event.uid) - 1);
                 ctx->current_event.uid[sizeof(ctx->current_event.uid) - 1] = '\0';
-            } else if (!ctx->skip_event && strncmp(line, "DTEND", 5) == 0) {
+            } else if (strncmp(line, "DTEND", 5) == 0) {
                 bool end_all_day = false;
                 ctx->current_event.has_end = ics_parse_datetime(
-                    val,
-                    &end_all_day,
-                    &ctx->current_event.end_ts,
-                    NULL,
-                    0
+                    val, &end_all_day, &ctx->current_event.end_ts, NULL, 0
                 );
-                if (end_all_day) {
-                    ctx->current_event.all_day = true;
+                if (end_all_day) ctx->current_event.all_day = true;
+            } else if (strncmp(line, "RRULE", 5) == 0 && (line[5] == '\0' || line[5] == ';')) {
+                if (strstr(val, "FREQ=DAILY"))   ctx->current_event.rrule_daily   = true;
+                if (strstr(val, "FREQ=WEEKLY"))  ctx->current_event.rrule_weekly  = true;
+                if (strstr(val, "FREQ=MONTHLY")) ctx->current_event.rrule_monthly = true;
+                if (strstr(val, "FREQ=YEARLY"))  ctx->current_event.rrule_yearly  = true;
+                char *interval_p = strstr(val, "INTERVAL=");
+                if (interval_p) ctx->current_event.rrule_interval = atoi(interval_p + 9);
+                char *byday_p = strstr(val, "BYDAY=");
+                if (byday_p) {
+                    static const char *wday_names[7] = {"SU","MO","TU","WE","TH","FR","SA"};
+                    const char *p = byday_p + 6;
+                    while (*p && *p != ';') {
+                        /* skip optional ordinal prefix (+/-N before the day code) */
+                        while (*p == '+' || *p == '-' || (*p >= '0' && *p <= '9')) p++;
+                        bool matched = false;
+                        for (int w = 0; w < 7; w++) {
+                            if (p[0] == wday_names[w][0] && p[1] == wday_names[w][1]) {
+                                ctx->current_event.rrule_byday |= (uint8_t)(1u << w);
+                                p += 2;
+                                matched = true;
+                                break;
+                            }
+                        }
+                        /* Guard: if no code matched, advance one char to avoid an infinite loop
+                         * on malformed or unrecognised BYDAY values. */
+                        if (!matched && *p) p++;
+                        if (*p == ',') p++;
+                    }
+                }
+                char *until_p = strstr(val, "UNTIL=");
+                if (until_p) {
+                    bool dummy = false;
+                    ics_parse_datetime(until_p + 6, &dummy, &ctx->current_event.rrule_until, NULL, 0);
+                }
+            } else if (strncmp(line, "EXDATE", 6) == 0 && (line[6] == '\0' || line[6] == ';')) {
+                char *p = val;
+                while (p && *p && ctx->current_event.exdate_count < ICS_MAX_EXDATES) {
+                    char *comma = strchr(p, ',');
+                    if (comma) *comma = '\0';
+                    bool dummy = false;
+                    time_t ex_ts = 0;
+                    if (ics_parse_datetime(p, &dummy, &ex_ts, NULL, 0) && ex_ts > 0) {
+                        ctx->current_event.exdates[ctx->current_event.exdate_count++] = ex_ts;
+                    }
+                    p = comma ? comma + 1 : NULL;
                 }
             }
         }
@@ -726,38 +897,25 @@ static esp_err_t ics_stream_handler(esp_http_client_event_t *evt) {
     for (int i = 0; i < data_len; i++) {
         char c = data[i];
 
+        if (c == '\r') continue;  /* skip CR in CRLF line endings */
+
         if (c == '\n') {
-            /* End of raw line — but check next char for folding */
             ctx->line_buf[ctx->line_len] = '\0';
-            ctx->prev_cr = false;
-            /* We need to peek at next char for line folding.
-               Store completed line, mark pending. */
-            /* For streaming we can't peek ahead easily,
-               so we use a flag: if next char is space/tab, it's a continuation */
-            /* Actually, set a "line_complete" state and check on next char */
-            /* Simplified: just process the line. If next chunk starts with
-               space/tab, we'll handle it by appending. We mark line as ready. */
-            ctx->line_buf[ctx->line_len] = '\0';
-            /* Process only if not followed by continuation (handled below) */
-            /* We'll process eagerly and re-append if continuation found */
+            ctx->line_pending = true;
+            continue;
+        }
+
+        if (ctx->line_pending) {
+            ctx->line_pending = false;
+            if (c == ' ' || c == '\t') {
+                /* RFC 5545 §3.1 line folding: a line starting with SPACE/TAB
+                 * is a continuation of the previous line. Discard the whitespace
+                 * and keep accumulating into the existing line_buf. */
+                continue;
+            }
+            /* New property line — process the buffered line, then start fresh */
             ics_process_line(ctx);
             ctx->line_len = 0;
-            continue;
-        }
-
-        if (c == '\r') {
-            ctx->prev_cr = true;
-            continue;
-        }
-
-        /* Line folding: if at start of line and char is space/tab, append to previous */
-        if (ctx->line_len == 0 && (c == ' ' || c == '\t')) {
-            /* This is a continuation — unfortunately we already processed the line.
-               For ICS feeds, continuation lines are rare for SUMMARY/DTSTART.
-               Skip the folding whitespace and start accumulating into line_buf
-               so the NEXT line-end will process it. This may lose the previous
-               line's data, but for our use case (short fields) it's acceptable. */
-            continue;
         }
 
         if (ctx->line_len < ICS_LINE_MAX - 1) {
@@ -813,14 +971,16 @@ static bool fetch_ics(const char *ics_url, int year, int month, int day) {
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "Accept", "text/calendar");
     esp_http_client_set_header(client, "Accept-Encoding", "identity");  /* prevent gzip — ESP can't decompress */
+    esp_http_client_set_header(client, "Cache-Control", "no-cache, no-store");
+    esp_http_client_set_header(client, "Pragma", "no-cache");
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
     s_ics_ctx = NULL;
 
-    /* Process any remaining line in buffer */
-    if (ics_ctx.line_len > 0) {
+    /* Flush any line still in the buffer (no trailing newline at EOF, or pending after last \n) */
+    if (ics_ctx.line_pending || ics_ctx.line_len > 0) {
         ics_ctx.line_buf[ics_ctx.line_len] = '\0';
         ics_process_line(&ics_ctx);
     }
@@ -830,8 +990,8 @@ static bool fetch_ics(const char *ics_url, int year, int month, int day) {
         return false;
     }
 
-    ESP_LOGI(TAG, "ICS streaming parse done, added %d events for %04d%02d%02d",
-             s_stage_count - added_before, year, month, day);
+    ESP_LOGI(TAG, "ICS streaming parse done: %d VEVENTs in file, added %d events for %04d%02d%02d",
+             ics_ctx.total_vevents, s_stage_count - added_before, year, month, day);
     return true;
 }
 
@@ -857,20 +1017,61 @@ bool calendar_fetch(void) {
     }
     s_suppress_completion_save = false;
 
-    if (!s_wifi_connected || !s_time_synced) { s_last_fetch_succeeded = false; return false; }
+    if (!s_wifi_connected) { s_last_fetch_succeeded = false; return false; }
+
+    /* SNTP runs in the background; if the initial boot wait expired before sync,
+     * re-check each attempt — the clock will be correct once NTP replies. */
+    if (!s_time_synced) {
+        time_t probe = time(NULL);
+        if (probe > 1700000000) {
+            s_time_synced = true;
+            struct tm pt;
+            localtime_r(&probe, &pt);
+            ESP_LOGI(TAG, "NTP synced (deferred): %04d-%02d-%02d %02d:%02d:%02d",
+                     pt.tm_year+1900, pt.tm_mon+1, pt.tm_mday,
+                     pt.tm_hour, pt.tm_min, pt.tm_sec);
+        } else {
+            s_last_fetch_succeeded = false;
+            return false;
+        }
+    }
 
     time_t now;
     time(&now);
+    now += (time_t)cal_day_offset * SECS_PER_DAY;
     struct tm t;
     localtime_r(&now, &t);
-    t.tm_mday += cal_day_offset;
-    mktime(&t);
+
+    /* Build query window spanning the full LOCAL day, expressed as UTC timestamps.
+     * Using T00:00:00Z with local date components is wrong: "Z" means UTC, so that
+     * query starts at 02:00 local for UTC+2 Sweden, silently dropping midnight–02:00
+     * events. Instead: convert local-midnight and local-end-of-day to UTC via mktime. */
+    struct tm day_start = {0};
+    day_start.tm_year = t.tm_year;
+    day_start.tm_mon  = t.tm_mon;
+    day_start.tm_mday = t.tm_mday;
+    day_start.tm_isdst = -1;
+    time_t start_utc = mktime(&day_start);
+
+    struct tm day_end = day_start;
+    day_end.tm_hour  = 23;
+    day_end.tm_min   = 59;
+    day_end.tm_sec   = 59;
+    day_end.tm_isdst = -1;
+    time_t end_utc = mktime(&day_end);
+
+    struct tm start_gmt, end_gmt;
+    gmtime_r(&start_utc, &start_gmt);
+    gmtime_r(&end_utc,   &end_gmt);
 
     char time_min[64], time_max[64];
-    snprintf(time_min, sizeof(time_min), "%04d-%02d-%02dT00:00:00Z",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-    snprintf(time_max, sizeof(time_max), "%04d-%02d-%02dT23:59:59Z",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+    snprintf(time_min, sizeof(time_min), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             start_gmt.tm_year + 1900, start_gmt.tm_mon + 1, start_gmt.tm_mday,
+             start_gmt.tm_hour, start_gmt.tm_min, start_gmt.tm_sec);
+    snprintf(time_max, sizeof(time_max), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             end_gmt.tm_year + 1900, end_gmt.tm_mon + 1, end_gmt.tm_mday,
+             end_gmt.tm_hour, end_gmt.tm_min, end_gmt.tm_sec);
+    ESP_LOGI(TAG, "Fetch window: %s to %s", time_min, time_max);
 
     s_stage_count = 0;
 
@@ -936,12 +1137,11 @@ void calendar_apply_staged(void) {
         s_task_cache_count[s_fetch_user] = n;
         s_task_cache_valid[s_fetch_user] = true;
         time_t now = time(NULL);
-        now += cal_day_offset * 86400;
+        now += cal_day_offset * SECS_PER_DAY;
         struct tm ct;
         localtime_r(&now, &ct);
         snprintf(s_task_cache_date[s_fetch_user], sizeof(s_task_cache_date[0]),
                  "%04d%02d%02d", ct.tm_year + 1900, ct.tm_mon + 1, ct.tm_mday);
-
     }
 
     /* Only touch the live view if the fetched user is still active — a user
@@ -963,7 +1163,7 @@ bool calendar_restore_cached_tasks(int user_idx) {
 
     /* Reject cache if it was built for a different day */
     time_t now = time(NULL);
-    now += cal_day_offset * 86400;
+    now += cal_day_offset * SECS_PER_DAY;
     struct tm ct;
     localtime_r(&now, &ct);
     char today[9];
