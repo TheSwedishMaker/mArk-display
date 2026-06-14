@@ -70,6 +70,7 @@ void calendar_sources_write_user(int user_idx, const cal_source_t *src, int coun
 bool calendar_restore_cached_tasks(int user_idx);
 
 /* Per-user completion state — call before switching active_user */
+void calendar_completion_restore_all(void);  /* call once at startup after nvs_flash_init */
 void calendar_save_completion_state(void);
 void calendar_suppress_next_completion_save(void);
 void calendar_sync_completion_cache(void);   /* call after toggling a task's completion */

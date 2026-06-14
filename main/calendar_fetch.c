@@ -194,6 +194,9 @@ static void save_completion_state(void) {
         return;
     }
 
+    /* Don't overwrite NVS-restored keys with an empty list on first fetch after reboot */
+    if (cal_task_count == 0) return;
+
     s_completed_count[u] = 0;
     memcpy(s_completed_date[u], today, sizeof(today));
 
@@ -237,10 +240,76 @@ static bool was_completed(const cal_task_t *task) {
     return false;
 }
 
+static void persist_completion_state(int u) {
+    char ns[16];
+    snprintf(ns, sizeof(ns), "u%d_comp", u);
+    nvs_handle_t h;
+    if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return;
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "date", s_completed_date[u]);
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < s_completed_count[u]; i++)
+        cJSON_AddItemToArray(arr, cJSON_CreateString(s_completed_keys[u][i].key));
+    cJSON_AddItemToObject(obj, "keys", arr);
+    char *json = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (json) {
+        nvs_set_str(h, "state", json);
+        free(json);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+static void restore_completion_state(int u) {
+    char ns[16];
+    snprintf(ns, sizeof(ns), "u%d_comp", u);
+    nvs_handle_t h;
+    if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = 0;
+    if (nvs_get_str(h, "state", NULL, &len) != ESP_OK || len == 0) { nvs_close(h); return; }
+    char *json = malloc(len);
+    if (!json) { nvs_close(h); return; }
+    nvs_get_str(h, "state", json, &len);
+    nvs_close(h);
+    cJSON *obj = cJSON_Parse(json);
+    free(json);
+    if (!obj) return;
+    cJSON *jdate = cJSON_GetObjectItem(obj, "date");
+    cJSON *jkeys = cJSON_GetObjectItem(obj, "keys");
+    if (cJSON_IsString(jdate)) {
+        strncpy(s_completed_date[u], jdate->valuestring, sizeof(s_completed_date[u]) - 1);
+        s_completed_date[u][sizeof(s_completed_date[u]) - 1] = '\0';
+    }
+    if (cJSON_IsArray(jkeys)) {
+        s_completed_count[u] = 0;
+        cJSON *item;
+        cJSON_ArrayForEach(item, jkeys) {
+            if (s_completed_count[u] >= MAX_COMPLETED_KEYS) break;
+            if (cJSON_IsString(item)) {
+                strncpy(s_completed_keys[u][s_completed_count[u]].key,
+                        item->valuestring, COMP_KEY_LEN - 1);
+                s_completed_keys[u][s_completed_count[u]].key[COMP_KEY_LEN - 1] = '\0';
+                s_completed_count[u]++;
+            }
+        }
+    }
+    cJSON_Delete(obj);
+    ESP_LOGI(TAG, "Restored %d completion key(s) for user %d (date: %s)",
+             s_completed_count[u], u, s_completed_date[u]);
+}
+
+/* Public: restore completion state for all users from NVS — call once at startup */
+void calendar_completion_restore_all(void) {
+    for (int u = 0; u < MAX_USERS; u++)
+        restore_completion_state(u);
+}
+
 /* Public: save the current user's completion state (call before switching active_user) */
 void calendar_save_completion_state(void) {
     s_fetch_user = (active_user >= 0 && active_user < MAX_USERS) ? active_user : 0;
     save_completion_state();
+    persist_completion_state(s_fetch_user);
 }
 
 /* Public: sync live cal_tasks[] completion flags into the task cache — call after toggling a task */

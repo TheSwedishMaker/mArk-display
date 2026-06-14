@@ -244,6 +244,7 @@ void app_main(void) {
 
     /* Load saved calendar sources for the active user */
     calendar_sources_load();
+    calendar_completion_restore_all();
 
     sound_init();
     ESP_LOGI(TAG, "Sound ready");
