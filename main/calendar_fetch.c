@@ -175,15 +175,27 @@ int weekly_tasks_load_user(int user_idx, int wday, cal_task_t *dest, int max_cou
 
 static void save_completion_state(void) {
     int u = s_fetch_user;
-    s_completed_count[u] = 0;
 
-    /* Tag the saved state with today's date (adjusted for day offset) */
     time_t now = time(NULL);
     now += cal_day_offset * SECS_PER_DAY;
     struct tm td;
     localtime_r(&now, &td);
-    snprintf(s_completed_date[u], sizeof(s_completed_date[u]), "%04d%02d%02d",
+    char today[9];
+    snprintf(today, sizeof(today), "%04d%02d%02d",
              td.tm_year + 1900, td.tm_mon + 1, td.tm_mday);
+
+    /* If the saved state is from a previous day, clear it and stop — do NOT
+     * carry over cal_tasks[] (which may still hold yesterday's recurring events)
+     * under today's date. That would cause recurring events to appear pre-completed. */
+    if (s_completed_date[u][0] != '\0' && strcmp(s_completed_date[u], today) != 0) {
+        s_completed_count[u] = 0;
+        memcpy(s_completed_date[u], today, sizeof(today));
+        ESP_LOGI(TAG, "Day rollover — completion state cleared for user %d", u);
+        return;
+    }
+
+    s_completed_count[u] = 0;
+    memcpy(s_completed_date[u], today, sizeof(today));
 
     for (int i = 0; i < cal_task_count && s_completed_count[u] < MAX_COMPLETED_KEYS; i++) {
         if (!cal_tasks[i].completed) continue;
