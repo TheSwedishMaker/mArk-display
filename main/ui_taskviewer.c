@@ -194,6 +194,7 @@ static void cb_complete(lv_event_t *e) {
     bool was = cal_tasks[ui_current].completed;
     cal_tasks[ui_current].completed = !was;
     calendar_sync_completion_cache();
+    calendar_save_completion_state();
 
     /* Challenge series tracking */
     cal_task_t *t = &cal_tasks[ui_current];
@@ -898,15 +899,12 @@ static void cb_settings_add_ics(lv_event_t *e) {
 static void cb_settings_save_sources(lv_event_t *e) {
     (void)e;
     if (settings_viewing_user == active_user) {
-        /* Update live sources and re-fetch */
+        /* Update live sources and request async refresh — background task handles
+         * calendar_apply_staged() + ui_refresh_all() without blocking the LVGL lock */
         cal_source_count = settings_temp_count;
         for (int i = 0; i < settings_temp_count; i++) cal_sources[i] = settings_temp_sources[i];
         calendar_sources_save();
-        calendar_fetch();
-        calendar_apply_staged();
-        ui_completed = calendar_get_completed();
-        if (ui_current >= cal_task_count) ui_current = 0;
-        ui_refresh_all();
+        calendar_request_refresh();
     } else {
         /* Save to NVS for this user without touching live data */
         calendar_sources_write_user(settings_viewing_user,
