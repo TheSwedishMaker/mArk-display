@@ -165,7 +165,7 @@ static lv_obj_t *lbl_btn_timer = NULL;
 /* ── Timer popup state ── */
 static lv_obj_t   *s_timer_popup           = NULL;   /* full-screen overlay */
 static lv_obj_t   *s_timer_popup_arc       = NULL;
-static lv_obj_t   *s_timer_popup_lbl       = NULL;   /* mm:ss or "Stopp" */
+static lv_obj_t   *s_timer_popup_lbl       = NULL;   /* mm:ss or TR_TIMER_STOP */
 static lv_obj_t   *s_timer_popup_pause_lbl = NULL;   /* pause/play button label */
 static lv_timer_t *s_timer_popup_lv_timer  = NULL;   /* 250 ms update tick */
 static lv_obj_t   *s_busy_popup            = NULL;   /* "already running" notice */
@@ -432,10 +432,9 @@ static void kb_add_local_task(void) {
     cal_task_t manual[20];
     int mc = manual_tasks_load_user(active_user, date8, manual, 20);
     if (mc < 20) {
+        memset(&manual[mc], 0, sizeof(manual[mc]));
         strncpy(manual[mc].title, kb_input, MAX_TITLE_LEN - 1);
         manual[mc].title[MAX_TITLE_LEN - 1] = '\0';
-        manual[mc].time[0] = '\0';
-        manual[mc].completed = false;
         mc++;
     }
     manual_tasks_save_user(active_user, date8, manual, mc);
@@ -445,19 +444,10 @@ static void kb_add_local_task(void) {
      * title__time composite key and survives the next fetch */
     if (cal_task_count < MAX_TASKS) {
         cal_task_t *ct = &cal_tasks[cal_task_count];
-        ct->id[0] = '\0';
+        memset(ct, 0, sizeof(*ct));
         strncpy(ct->title, kb_input, MAX_TITLE_LEN - 1);
         ct->title[MAX_TITLE_LEN - 1] = '\0';
-        ct->time[0] = '\0';
-        ct->completed = false;
         cal_task_count++;
-
-        /* If we were showing "Inga uppgifter" placeholder, remove it */
-        if (cal_task_count == 2 && strcmp(cal_tasks[0].title, "Inga uppgifter") == 0) {
-            cal_tasks[0] = cal_tasks[1];
-            cal_task_count = 1;
-        }
-
         ui_refresh_all();
     }
     hide_keyboard();
@@ -1345,7 +1335,7 @@ static void cb_timer_popup_tick(lv_timer_t *t) {
     }
     if (s_timer_popup_lbl) {
         if (ts->expired) {
-            lv_label_set_text(s_timer_popup_lbl, "Stopp");
+            lv_label_set_text(s_timer_popup_lbl, TR_TIMER_STOP);
         } else {
             char buf[8];
             snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
@@ -1465,11 +1455,11 @@ static void show_timer_popup(void) {
     lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
     s_timer_popup_arc = arc;
 
-    /* Centre label overlaid on arc: "mm:ss" while running, "Stopp" when expired.
+    /* Centre label overlaid on arc: "mm:ss" while running, TR_TIMER_STOP when expired.
      * Arc top=22, height=210, centre=22+105=127. Font ui_48 ~56px tall → top=127-28=99. */
     lv_obj_t *lbl = lv_label_create(card);
     if (expired) {
-        lv_label_set_text(lbl, "Stopp");
+        lv_label_set_text(lbl, TR_TIMER_STOP);
     } else {
         char buf[8];
         snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)(rem / 60), (unsigned)(rem % 60));
@@ -1563,7 +1553,7 @@ static void show_timer_busy_popup(void) {
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *lbl = lv_label_create(card);
-    lv_label_set_text(lbl, "En timer k\xC3\xB6rs\nredan i bakgrunden");
+    lv_label_set_text(lbl, TR_TIMER_BUSY);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(lbl, 260);
     lv_obj_set_style_text_font(lbl, &lv_font_ui_14, 0);

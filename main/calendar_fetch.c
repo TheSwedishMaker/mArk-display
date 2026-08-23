@@ -76,6 +76,11 @@ static int s_fetch_user = 0;
 
 /* ── Manual tasks (NVS-backed, editable from web UI) — per user ── */
 
+/* Defined below with the ICS/Google parsers — manual tasks support the
+ * [Name:N] challenge tag too ([T] needs an event duration, so it does not
+ * apply to manual tasks). */
+static void parse_challenge_tag(cal_task_t *ct);
+
 static void manual_ns_for_user(int idx, char *buf, size_t len) {
     snprintf(buf, len, "u%d_tsk", idx);
 }
@@ -135,12 +140,12 @@ static int manual_tasks_load_key(int user_idx, const char *key, cal_task_t *dest
         if (count >= max_count) break;
         cJSON *jt = cJSON_GetObjectItem(item, "t");
         cJSON *jm = cJSON_GetObjectItem(item, "m");
+        memset(&dest[count], 0, sizeof(dest[count]));  /* clear challenge/timer fields */
         strncpy(dest[count].title, cJSON_IsString(jt) ? jt->valuestring : "", MAX_TITLE_LEN - 1);
         dest[count].title[MAX_TITLE_LEN - 1] = '\0';
         strncpy(dest[count].time, cJSON_IsString(jm) ? jm->valuestring : "", sizeof(dest[count].time) - 1);
         dest[count].time[sizeof(dest[count].time) - 1] = '\0';
-        dest[count].id[0] = '\0';
-        dest[count].completed = false;  /* completion applied later via was_completed() */
+        parse_challenge_tag(&dest[count]);
         count++;
     }
     cJSON_Delete(arr);
@@ -1164,15 +1169,15 @@ bool calendar_fetch(void) {
     {
         char date8[9];
         snprintf(date8, sizeof(date8), "%04d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-        cal_task_t buf[MANUAL_TASK_MAX];
-        int n = manual_tasks_load_user(s_fetch_user, date8, buf, MANUAL_TASK_MAX);
+        cal_task_t buf[MAX_TASKS];
+        int n = manual_tasks_load_user(s_fetch_user, date8, buf, MAX_TASKS);
         for (int i = 0; i < n && s_stage_count < MAX_TASKS; i++) {
             buf[i].completed = was_completed(&buf[i]);
             s_stage[s_stage_count++] = buf[i];
         }
 
         /* Weekly recurring tasks for this weekday (tm_wday set by mktime above) */
-        n = weekly_tasks_load_user(s_fetch_user, t.tm_wday, buf, MANUAL_TASK_MAX);
+        n = weekly_tasks_load_user(s_fetch_user, t.tm_wday, buf, MAX_TASKS);
         for (int i = 0; i < n && s_stage_count < MAX_TASKS; i++) {
             buf[i].completed = was_completed(&buf[i]);
             s_stage[s_stage_count++] = buf[i];

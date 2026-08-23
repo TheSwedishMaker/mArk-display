@@ -398,6 +398,7 @@ static bool task_item_is_weekly(const cJSON *item) {
 static void task_from_json(cal_task_t *dst, const cJSON *item) {
     cJSON *jttl = cJSON_GetObjectItem((cJSON *)item, "title");
     cJSON *jtm  = cJSON_GetObjectItem((cJSON *)item, "time");
+    memset(dst, 0, sizeof(*dst));  /* clear challenge/timer fields */
     strncpy(dst->title,
             cJSON_IsString(jttl) ? jttl->valuestring : "Task",
             MAX_TITLE_LEN - 1);
