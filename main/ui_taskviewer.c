@@ -89,6 +89,14 @@ static bool ui_leds_suppressed = false;  /* LEDs off after day complete */
 static bool ui_showing_keyboard = false;
 static bool ui_showing_settings = false;
 
+/* Navigate to the first uncompleted task, or task 0 if all are done. */
+static void ui_jump_to_first_incomplete(void) {
+    ui_current = 0;
+    for (int i = 0; i < cal_task_count; i++) {
+        if (!cal_tasks[i].completed) { ui_current = i; break; }
+    }
+}
+
 /* ── User bar — one button per user across the top of the right panel ── */
 static lv_obj_t *user_bar_btns[MAX_USERS]       = {0};
 static lv_obj_t *user_bar_medal_imgs[MAX_USERS] = {0};
@@ -777,7 +785,7 @@ static void cb_settings_remove_user(lv_event_t *e) {
     user_store_save();
 
     if (was_active) {
-        ui_current = 0;
+        ui_jump_to_first_incomplete();
         ui_completed = calendar_get_completed();
         calendar_request_refresh();
         ui_refresh_all();
@@ -2155,7 +2163,7 @@ static void cb_switch_user(lv_event_t *e) {
     calendar_save_completion_state();
 
     ui_completed = calendar_get_completed();
-    ui_current = 0;
+    ui_jump_to_first_incomplete();
     ui_refresh_all();
 
     calendar_suppress_next_completion_save();
