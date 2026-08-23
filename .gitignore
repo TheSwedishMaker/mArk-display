@@ -5,7 +5,6 @@ main/secrets.h
 build/
 sdkconfig.old
 managed_components/
-dependencies.lock
 
 # macOS
 .DS_Store
