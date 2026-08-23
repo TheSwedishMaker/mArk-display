@@ -10,9 +10,13 @@ Built on a 10" touchscreen, mArk lives on the kitchen counter or wherever the fa
 - LED strip shows how much of the day is done
 - Monthly highscore: days completed this month, fresh competition every month
 - Levels (Starter → Consistent → Dedicated → Unstoppable → Legend → Titan) built on your total completed days — they never reset
+- Recurring calendar events (daily/weekly/monthly/yearly) from ICS feeds, including removed single occurrences
+- Countdown timers: add `[T]` to a calendar event and the task gets a built-in timer with an alarm
+- Challenge medals: tag a task `[Name:N]` and earn a gold medal every N completions
 - Rotary encoder for scrolling through tasks without touching the screen
 - Web interface for managing calendars and tasks from any phone — no computer needed
 - Wireless firmware updates from the browser after the first install
+- English or Swedish display language (compile-time option in `secrets.h`)
 - Soft power button: short press to turn the display and LEDs on/off
 
 ---
@@ -235,6 +239,28 @@ Tasks refresh automatically every 5 minutes. The display also refreshes when you
 
 ---
 
+## Calendar tags — extra features straight from your calendar
+
+Add these tags to an event's title in your calendar; mArk picks them up and hides the tag from the displayed name.
+
+**`[T]` — countdown timer.** The task gets a timer button whose duration equals the event's length (end time minus start time). Tap to start; pause, resume or stop it; when it reaches zero an alarm sounds and the display wakes. Example: `Workout [T]`.
+
+**`[Name:N]` — challenge series.** Links the task to a named challenge: every N completions earns a gold medal, shown next to your name on the leaderboard. Medals are permanent. Each family member has their own progress per series. Examples: `Run [Running:30]`, `Meditate [Calm:100]`. Works in calendar events and in manual tasks added from the web page.
+
+---
+
+## Display language
+
+The display is in English by default. For Swedish, uncomment this line in your local `main/secrets.h` and rebuild:
+
+```c
+#define UI_LANG_SV  1
+```
+
+All display strings live in `main/lang.h`.
+
+---
+
 ## Monthly highscore and levels
 
 Every day someone completes all their tasks adds one day to their **monthly count** — the number shown in the sidebar and on the leaderboard. The count starts fresh at the beginning of each month, so every month is a new competition. Missing a day (being away, sick, no tasks) never takes anything away.
@@ -283,6 +309,12 @@ All users, tasks, scores and calendar settings are kept. A failed or interrupted
 ### Full component list
 
 See `COMPONENTS.md`.
+
+---
+
+## Credits
+
+Recurring-event support (RRULE/EXDATE), the countdown timer, the challenge medal system, completion persistence across reboots, and several bug fixes were contributed by **[Christoffer Sjösten (Chriffe)](https://github.com/Chriffe)** in the [mArk-neo](https://github.com/Chriffe/mArk-neo) fork — thank you! His commits carry his authorship in this repository's history.
 
 ---
 
