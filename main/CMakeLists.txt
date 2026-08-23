@@ -29,6 +29,7 @@ idf_component_register(
     PRIV_REQUIRES
         bsp_illuminate
         mbedtls
+        app_update
 )
 
 target_compile_options(__idf_main PRIVATE -Wno-format-truncation)

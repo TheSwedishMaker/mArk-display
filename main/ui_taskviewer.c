@@ -321,11 +321,12 @@ static void kb_add_local_task(void) {
     }
     manual_tasks_save_user(active_user, date8, manual, mc);
 
-    /* Add to live task list for immediate display — use same ID format as
-     * manual_tasks_load_user so completion tracking survives the next fetch */
+    /* Add to live task list for immediate display — empty id, same as
+     * manual_tasks_load_user, so completion tracking uses the stable
+     * title__time composite key and survives the next fetch */
     if (cal_task_count < MAX_TASKS) {
         cal_task_t *ct = &cal_tasks[cal_task_count];
-        snprintf(ct->id, sizeof(ct->id), "manual-%d-%d", active_user, mc - 1);
+        ct->id[0] = '\0';
         strncpy(ct->title, kb_input, MAX_TITLE_LEN - 1);
         ct->title[MAX_TITLE_LEN - 1] = '\0';
         ct->time[0] = '\0';
@@ -1241,7 +1242,7 @@ static void refresh_dots(void) {
 
 static void refresh_sidebar(void) {
     char s[8];
-    snprintf(s, sizeof(s), "%" PRId32, streak_data.streak);
+    snprintf(s, sizeof(s), "%" PRId32, streak_month_days(&streak_data));
     lv_label_set_text(lbl_streak_num, s);
 
     const streak_level_t *lvl = streak_get_level();
@@ -1250,7 +1251,7 @@ static void refresh_sidebar(void) {
     const streak_level_t *next = streak_get_next_level();
     if (next) {
         char nx[32];
-        snprintf(nx, sizeof(nx), "%" PRId32 "d to %s", (int32_t)(next->threshold - streak_data.streak), next->name);
+        snprintf(nx, sizeof(nx), "%" PRId32 "d to %s", (int32_t)(next->threshold - streak_data.total_days), next->name);
         lv_label_set_text(lbl_level_next, nx);
         lv_obj_clear_flag(lbl_level_next, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -1320,10 +1321,10 @@ static void show_complete_screen(void) {
     lv_obj_set_style_text_font(sub, &lv_font_ui_14, 0);
     lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 240);
 
-    /* Streak info */
-    char streak_buf[32];
-    snprintf(streak_buf, sizeof(streak_buf), "%" PRId32 " day streak  •  %s",
-             streak_data.streak, streak_get_level()->name);
+    /* Monthly highscore info */
+    char streak_buf[48];
+    snprintf(streak_buf, sizeof(streak_buf), "%" PRId32 " days this month  •  %s",
+             streak_month_days(&streak_data), streak_get_level()->name);
     lv_obj_t *streak_lbl = lv_label_create(complete_screen);
     lv_label_set_text(streak_lbl, streak_buf);
     lv_obj_set_style_text_color(streak_lbl, C_ACCENT, 0);
@@ -1406,10 +1407,10 @@ static void show_leaderboard(void) {
         streak_read_user(i, &entries[n].sd);
         n++;
     }
-    /* Sort descending by streak */
+    /* Sort descending by days completed this month */
     for (int i = 0; i < n - 1; i++) {
         for (int j = i + 1; j < n; j++) {
-            if (entries[j].sd.streak > entries[i].sd.streak) {
+            if (streak_month_days(&entries[j].sd) > streak_month_days(&entries[i].sd)) {
                 entry_t tmp = entries[i]; entries[i] = entries[j]; entries[j] = tmp;
             }
         }
@@ -1442,7 +1443,7 @@ static void show_leaderboard(void) {
 
     /* Title */
     lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, "STREAKS");
+    lv_label_set_text(title, "THIS MONTH");
     lv_obj_set_style_text_color(title, C_ACCENT, 0);
     lv_obj_set_style_text_font(title, &lv_font_ui_14, 0);
     lv_obj_set_pos(title, 28, 20);
@@ -1489,14 +1490,14 @@ static void show_leaderboard(void) {
 
         /* Level name */
         lv_obj_t *lvl_lbl = lv_label_create(row);
-        lv_label_set_text(lvl_lbl, streak_level_for(entries[i].sd.streak));
+        lv_label_set_text(lvl_lbl, streak_level_for(entries[i].sd.total_days));
         lv_obj_set_style_text_color(lvl_lbl, is_active ? lv_color_hex(0xFFDDB8) : th_muted(), 0);
         lv_obj_set_style_text_font(lvl_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_pos(lvl_lbl, 44, 32);
 
-        /* Streak number (right-aligned) */
+        /* Days-this-month number (right-aligned) */
         char streak_buf[16];
-        snprintf(streak_buf, sizeof(streak_buf), "%" PRId32, entries[i].sd.streak);
+        snprintf(streak_buf, sizeof(streak_buf), "%" PRId32, streak_month_days(&entries[i].sd));
         lv_obj_t *streak_num = lv_label_create(row);
         lv_label_set_text(streak_num, streak_buf);
         lv_obj_set_style_text_color(streak_num, is_active ? C_WHITE : th_fg(), 0);
@@ -1688,7 +1689,7 @@ void ui_build(void) {
     lv_obj_set_pos(lbl_streak_num, 64, 10);
 
     lbl_streak_label = lv_label_create(sc);
-    lv_label_set_text(lbl_streak_label, "day streak");
+    lv_label_set_text(lbl_streak_label, "days this month");
     lv_obj_set_style_text_color(lbl_streak_label, th_fg(), 0);
     lv_obj_set_style_text_font(lbl_streak_label, &lv_font_ui_14, 0);
     lv_obj_set_pos(lbl_streak_label, 64, 42);

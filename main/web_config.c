@@ -8,6 +8,10 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "mdns.h"
 #include "cJSON.h"
 
@@ -73,6 +77,8 @@ static const char HTML_PAGE_1[] =
 ".tm{font-size:13px}"
 ".rmt{background:none;border:none;font-size:20px;color:#C0BEBB;cursor:pointer;padding:0 4px;line-height:1;margin-top:2px}"
 ".rmt:hover{color:#c0392b}"
+".wkr{display:flex;align-items:center;gap:6px;font-size:12px;color:#8A8A7A;margin-top:6px;cursor:pointer}"
+".wkr input{width:14px;height:14px;accent-color:#E8742A;cursor:pointer}"
 "details{margin:10px 0 4px}"
 "details summary{font-size:13px;color:#8A8A7A;cursor:pointer;padding:6px 0;list-style:none}"
 ".hb{background:#F5F0E8;border-radius:8px;padding:14px;font-size:13px;line-height:1.7;margin-top:6px;border:1px solid #E0DDD8}"
@@ -109,7 +115,7 @@ static const char HTML_CAL_SECTION[] =
 "</div>"   /* close left panel */
 "<div class='panel'>"  /* open right panel */
 "<h2>Tasks</h2>"
-"<p class='sub'>Add manual tasks for any person &mdash; plan up to a week ahead.</p>"
+"<p class='sub'>Add manual tasks for any person &mdash; plan up to a week ahead. Tick <i>Every ...</i> to repeat a task weekly on that weekday.</p>"
 "<div class='tabs' id='user-tabs'></div>"
 "<div class='dtabs' id='date-tabs'></div>"
 "<div id='task-list'></div>"
@@ -117,16 +123,20 @@ static const char HTML_CAL_SECTION[] =
 "<div class='st' id='tst'></div>"
 "<button class='sbtn' id='tBtn' onclick='saveTasks()'>Save Tasks</button>"
 "</div>"   /* close right panel */
-"</div>";  /* close layout */
+"</div>"   /* close layout */
+"<p style='margin-top:16px;font-size:12px;color:#8A8A7A;text-align:center'>"
+"<a href='/update' style='color:#8A8A7A'>Firmware update</a></p>";
 
 /* All JavaScript — runs after USERS/ACTIVE_USER are injected by handle_root */
 static const char HTML_TASK_SECTION[] =
 "<script>"
 "var sources=[];var tasks=[];var taskUser=0;var calUser=ACTIVE_USER;"
+"var loadSeq=0;var tasksValid=false;"
 "var today=new Date();"
 "var DATES=(function(){var a=[];for(var i=0;i<7;i++){var d=new Date(today.getFullYear(),today.getMonth(),today.getDate()+i);a.push(d.getFullYear().toString()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0'));}return a;})();"
 "var taskDate=DATES[0];var taskDateIdx=0;"
 "function dlbl(d,i){return i===0?'Today':['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()]+' '+d.getDate();}"
+"function wdName(){return ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][new Date(today.getFullYear(),today.getMonth(),today.getDate()+taskDateIdx).getDay()];}"
 "function renderDateTabs(){"
 "var h='';"
 "for(var i=0;i<7;i++){"
@@ -158,7 +168,7 @@ static const char HTML_TASK_SECTION[] =
 "function saveSources(){"
 "var btn=document.getElementById('cBtn');var st=document.getElementById('cst');"
 "btn.disabled=true;btn.textContent='Saving...';"
-"fetch('/api/sources?user='+calUser,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(sources)})"
+"fetch('/api/sources?user='+calUser,{method:'POST',headers:{'Content-Type':'application/json','X-Rev':'2'},body:JSON.stringify(sources)})"
 ".then(r=>r.json()).then(function(){"
 "st.textContent=calUser===ACTIVE_USER?'Saved! Display will refresh.':'Saved for '+USERS[calUser]+'.';"
 "btn.disabled=false;btn.textContent='Save Calendars';"
@@ -170,7 +180,16 @@ static const char HTML_TASK_SECTION[] =
 "h+='<button class=\"tab'+(i===taskUser?' on':'')+' \" onclick=\"switchUser('+i+')\">'+esc(u)+'</button>';});"
 "document.getElementById('user-tabs').innerHTML=h;}"
 "function switchUser(i){taskUser=i;renderUserTabs();loadTasks();}"
-"function loadTasks(){fetch('/api/tasks?user='+taskUser+'&date='+taskDate).then(r=>r.json()).then(function(d){tasks=d;renderTasks();});}"
+"function loadTasks(){"
+"var q=++loadSeq;tasksValid=false;"
+"fetch('/api/tasks?user='+taskUser+'&date='+taskDate).then(r=>r.json()).then(function(d){"
+"if(q!==loadSeq)return;"  /* stale response from an earlier tab — discard */
+"tasks=d;tasksValid=true;renderTasks();"
+"}).catch(function(){"
+"if(q!==loadSeq)return;"
+"tasks=[];renderTasks();"
+"document.getElementById('tst').textContent='Load failed - tap a day tab to retry';"
+"});}"
 "function renderTasks(){"
 "var h='';"
 "if(!tasks.length)h='<p class=\"empty\">No tasks for this day.</p>';"
@@ -178,14 +197,16 @@ static const char HTML_TASK_SECTION[] =
 "h+='<div class=\"tr\"><div class=\"ti\">';"
 "h+='<input class=\"tt\" type=\"text\" value=\"'+esc(t.title)+'\" onchange=\"tasks['+i+'].title=this.value\" placeholder=\"Task title\">';"
 "h+='<input class=\"tm\" type=\"text\" value=\"'+esc(t.time)+'\" onchange=\"tasks['+i+'].time=this.value\" placeholder=\"Time e.g. 08:30 (optional)\">';"
+"h+='<label class=\"wkr\"><input type=\"checkbox\" '+(t.weekly?'checked':'')+' onchange=\"tasks['+i+'].weekly=this.checked\"><span>Every '+wdName()+'</span></label>';"
 "h+='</div><button class=\"rmt\" onclick=\"rmTask('+i+')\">&times;</button></div>';});"
 "document.getElementById('task-list').innerHTML=h;}"
-"function addTask(){tasks.push({title:'',time:''});renderTasks();var el=document.querySelectorAll('.tt');if(el.length)el[el.length-1].focus();}"
+"function addTask(){tasks.push({title:'',time:'',weekly:false});renderTasks();var el=document.querySelectorAll('.tt');if(el.length)el[el.length-1].focus();}"
 "function rmTask(i){tasks.splice(i,1);renderTasks();}"
 "function saveTasks(){"
 "var btn=document.getElementById('tBtn');var st=document.getElementById('tst');"
+"if(!tasksValid){st.textContent='List not loaded - tap a day tab to retry';return;}"  /* saving a stale/failed list would wipe this weekday's tasks */
 "btn.disabled=true;btn.textContent='Saving...';"
-"fetch('/api/tasks?user='+taskUser+'&date='+taskDate,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(tasks)})"
+"fetch('/api/tasks?user='+taskUser+'&date='+taskDate,{method:'POST',headers:{'Content-Type':'application/json','X-Rev':'2'},body:JSON.stringify(tasks)})"
 ".then(r=>r.json()).then(function(){"
 "st.textContent='Saved! Will appear on device.';"
 "btn.disabled=false;btn.textContent='Save Tasks';"
@@ -195,9 +216,22 @@ static const char HTML_TASK_SECTION[] =
 "renderCalUserTabs();renderUserTabs();renderDateTabs();loadSources();loadTasks();"
 "</script></body></html>";
 
+/* Reject writes from outdated cached copies of the page — the pre-guard JS
+ * could save one user's task list under another user/date (tab race). The
+ * current page sends X-Rev: 2 with every POST; a stale page does not. */
+static bool page_rev_ok(httpd_req_t *req) {
+    char rev[8] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Rev", rev, sizeof(rev)) != ESP_OK)
+        return false;
+    return strcmp(rev, "2") == 0;
+}
+
 /* ── GET / — serve config page ── */
 static esp_err_t handle_root(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
+    /* Never let browsers cache the page — a stale copy of the JS can save
+     * task lists under the wrong user/date */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
     httpd_resp_send_chunk(req, HTML_PAGE_1, strlen(HTML_PAGE_1));
 
@@ -263,6 +297,10 @@ static esp_err_t handle_get_sources(httpd_req_t *req) {
 
 /* ── POST /api/sources?user=N — save calendar sources for any user ── */
 static esp_err_t handle_post_sources(httpd_req_t *req) {
+    if (!page_rev_ok(req)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Page outdated - reload the page");
+        return ESP_FAIL;
+    }
     char query[16] = {0};
     int user_idx = active_user;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
@@ -339,6 +377,49 @@ static esp_err_t handle_post_sources(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* Weekday (Sunday=0..Saturday=6) for a YYYYMMDD date string */
+static int weekday_of_date8(const char *date8) {
+    int y = 0, m = 0, d = 0;
+    if (sscanf(date8, "%4d%2d%2d", &y, &m, &d) != 3) return -1;
+    struct tm t = {0};
+    t.tm_year = y - 1900;
+    t.tm_mon  = m - 1;
+    t.tm_mday = d;
+    t.tm_hour = 12;   /* midday — immune to DST edge cases */
+    if (mktime(&t) == (time_t)-1) return -1;
+    return t.tm_wday;
+}
+
+static bool task_item_is_weekly(const cJSON *item) {
+    const cJSON *jwk = cJSON_GetObjectItem((cJSON *)item, "weekly");
+    return cJSON_IsBool(jwk) && cJSON_IsTrue(jwk);
+}
+
+static void task_from_json(cal_task_t *dst, const cJSON *item) {
+    cJSON *jttl = cJSON_GetObjectItem((cJSON *)item, "title");
+    cJSON *jtm  = cJSON_GetObjectItem((cJSON *)item, "time");
+    strncpy(dst->title,
+            cJSON_IsString(jttl) ? jttl->valuestring : "Task",
+            MAX_TITLE_LEN - 1);
+    dst->title[MAX_TITLE_LEN - 1] = '\0';
+    strncpy(dst->time,
+            cJSON_IsString(jtm) ? jtm->valuestring : "",
+            sizeof(dst->time) - 1);
+    dst->time[sizeof(dst->time) - 1] = '\0';
+    dst->id[0] = '\0';
+    dst->completed = false;
+}
+
+static void append_tasks_json(cJSON *arr, const cal_task_t *tasks, int count, bool weekly) {
+    for (int i = 0; i < count; i++) {
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(obj, "title", tasks[i].title);
+        cJSON_AddStringToObject(obj, "time",  tasks[i].time);
+        cJSON_AddBoolToObject(obj,   "weekly", weekly);
+        cJSON_AddItemToArray(arr, obj);
+    }
+}
+
 /* ── GET /api/tasks?user=N&date=YYYYMMDD — return manual tasks for a user/date ── */
 static esp_err_t handle_get_tasks(httpd_req_t *req) {
     char query[48] = {0};
@@ -357,16 +438,17 @@ static esp_err_t handle_get_tasks(httpd_req_t *req) {
         snprintf(date8, sizeof(date8), "%04d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
     }
 
+    /* One buffer for both loads — each batch is fully serialized into the
+     * cJSON array before the buffer is reused. A second array would put
+     * ~5.5 KB of locals on the 8 KB httpd task stack. */
     cal_task_t tasks[20];
-    int count = manual_tasks_load_user(user_idx, date8, tasks, 20);
-
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < count; i++) {
-        cJSON *obj = cJSON_CreateObject();
-        cJSON_AddStringToObject(obj, "title", tasks[i].title);
-        cJSON_AddStringToObject(obj, "time",  tasks[i].time);
-        cJSON_AddItemToArray(arr, obj);
-    }
+
+    int count = manual_tasks_load_user(user_idx, date8, tasks, 20);
+    append_tasks_json(arr, tasks, count, false);
+
+    count = weekly_tasks_load_user(user_idx, weekday_of_date8(date8), tasks, 20);
+    append_tasks_json(arr, tasks, count, true);
     char *json = cJSON_PrintUnformatted(arr);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, strlen(json));
@@ -377,6 +459,10 @@ static esp_err_t handle_get_tasks(httpd_req_t *req) {
 
 /* ── POST /api/tasks?user=N&date=YYYYMMDD — save manual tasks for a user/date ── */
 static esp_err_t handle_post_tasks(httpd_req_t *req) {
+    if (!page_rev_ok(req)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Page outdated - reload the page");
+        return ESP_FAIL;
+    }
     char query[48] = {0};
     int user_idx = active_user;
     char date8[10] = {0};
@@ -416,32 +502,161 @@ static esp_err_t handle_post_tasks(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    cal_task_t tasks[20];
-    int count = 0;
-    cJSON *item;
-    cJSON_ArrayForEach(item, arr) {
-        if (count >= 20) break;
-        cJSON *jttl  = cJSON_GetObjectItem(item, "title");
-        cJSON *jtm   = cJSON_GetObjectItem(item, "time");
-        strncpy(tasks[count].title,
-                cJSON_IsString(jttl) ? jttl->valuestring : "Task",
-                MAX_TITLE_LEN - 1);
-        tasks[count].title[MAX_TITLE_LEN - 1] = '\0';
-        strncpy(tasks[count].time,
-                cJSON_IsString(jtm) ? jtm->valuestring : "",
-                sizeof(tasks[count].time) - 1);
-        tasks[count].time[sizeof(tasks[count].time) - 1] = '\0';
-        tasks[count].completed = false;
-        count++;
+    int wday = weekday_of_date8(date8);
+    if (wday < 0) {
+        /* Never save half a payload: a bad date would silently discard the
+         * weekly tasks while reporting success */
+        cJSON_Delete(arr);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad date");
+        return ESP_FAIL;
     }
-    cJSON_Delete(arr);
 
+    /* Split into date-bound and weekly tasks with two passes over the parsed
+     * document, reusing one buffer — two arrays would put ~5.5 KB of locals
+     * on the 8 KB httpd task stack */
+    cal_task_t tasks[20];
+    int count;
+    cJSON *item;
+
+    count = 0;
+    cJSON_ArrayForEach(item, arr) {
+        if (task_item_is_weekly(item) || count >= 20) continue;
+        task_from_json(&tasks[count++], item);
+    }
     manual_tasks_save_user(user_idx, date8, tasks, count);
+
+    count = 0;
+    cJSON_ArrayForEach(item, arr) {
+        if (!task_item_is_weekly(item) || count >= 20) continue;
+        task_from_json(&tasks[count++], item);
+    }
+    weekly_tasks_save_user(user_idx, wday, tasks, count);
+
+    cJSON_Delete(arr);
     calendar_request_refresh();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
+}
+
+/* ── Firmware update (OTA) ── */
+
+static const char OTA_PAGE[] =
+"<!DOCTYPE html>"
+"<html lang='en'><head>"
+"<meta charset='UTF-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>mArk Firmware Update</title>"
+"<style>"
+"body{font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;background:#F5F0E8;color:#2C2C2C;padding:24px;max-width:480px;margin:0 auto}"
+"h1{font-size:20px;margin-bottom:8px}"
+"p{color:#8A8A7A;font-size:13px;margin-bottom:16px}"
+"input[type=file]{width:100%;margin-bottom:14px;font-size:14px}"
+"button{width:100%;padding:12px;background:#E8742A;color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer}"
+"button:disabled{opacity:.5}"
+"#st{margin-top:14px;font-size:14px;color:#E8742A;min-height:20px}"
+"a{color:#E8742A}"
+"</style></head><body>"
+"<h1>Firmware Update</h1>"
+"<p>Build the project, then upload <b>build/task_viewer.bin</b>. "
+"The display keeps all users, tasks and scores. Do not power off during the update.</p>"
+"<input type='file' id='f' accept='.bin'>"
+"<button id='b' onclick='up()'>Upload &amp; install</button>"
+"<div id='st'></div>"
+"<p style='margin-top:20px'><a href='/'>&larr; Back to settings</a></p>"
+"<script>"
+"function up(){"
+"var f=document.getElementById('f').files[0];"
+"var st=document.getElementById('st');var b=document.getElementById('b');"
+"if(!f){st.textContent='Pick the .bin file first';return;}"
+"b.disabled=true;st.textContent='Uploading... keep this page open';"
+"fetch('/update',{method:'POST',body:f}).then(function(r){return r.text().then(function(t){return{ok:r.ok,t:t};});})"
+".then(function(x){st.textContent=x.ok?x.t+' - display is restarting':'Failed: '+x.t;b.disabled=false;})"
+".catch(function(e){st.textContent='Failed: '+e;b.disabled=false;});}"
+"</script></body></html>";
+
+static esp_err_t handle_ota_page(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, OTA_PAGE, strlen(OTA_PAGE));
+    return ESP_OK;
+}
+
+static esp_err_t handle_ota_post(httpd_req_t *req) {
+    size_t total = req->content_len;
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+
+    if (!part) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        return ESP_FAIL;
+    }
+    if (total < 0x10000 || total > part->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not a valid firmware size");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: receiving %u bytes into %s", (unsigned)total, part->label);
+
+    esp_ota_handle_t ota;
+    if (esp_ota_begin(part, total, &ota) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(4096);
+    if (!buf) {
+        esp_ota_abort(ota);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    size_t received = 0;
+    bool first_chunk = true;
+    while (received < total) {
+        size_t want = total - received;
+        if (want > 4096) want = 4096;
+        int r = httpd_req_recv(req, buf, want);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) {
+            free(buf);
+            esp_ota_abort(ota);
+            ESP_LOGE(TAG, "OTA: receive failed at %u bytes", (unsigned)received);
+            return ESP_FAIL;
+        }
+        if (first_chunk) {
+            if ((uint8_t)buf[0] != 0xE9) {  /* ESP image magic byte */
+                free(buf);
+                esp_ota_abort(ota);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Not an ESP firmware image");
+                return ESP_FAIL;
+            }
+            first_chunk = false;
+        }
+        if (esp_ota_write(ota, buf, r) != ESP_OK) {
+            free(buf);
+            esp_ota_abort(ota);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write failed");
+            return ESP_FAIL;
+        }
+        received += (size_t)r;
+    }
+    free(buf);
+
+    if (esp_ota_end(ota) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Image validation failed");
+        return ESP_FAIL;
+    }
+    if (esp_ota_set_boot_partition(part) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Set boot failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA: update written to %s — restarting", part->label);
+    httpd_resp_sendstr(req, "Update installed");
+    vTaskDelay(pdMS_TO_TICKS(750));  /* let the response reach the browser */
+    esp_restart();
+    return ESP_OK;  /* not reached */
 }
 
 /* ── Start server ── */
@@ -469,12 +684,16 @@ void web_config_start(void) {
     httpd_uri_t uri_post_src   = { .uri = "/api/sources",.method = HTTP_POST, .handler = handle_post_sources };
     httpd_uri_t uri_get_tasks  = { .uri = "/api/tasks",  .method = HTTP_GET,  .handler = handle_get_tasks };
     httpd_uri_t uri_post_tasks = { .uri = "/api/tasks",  .method = HTTP_POST, .handler = handle_post_tasks };
+    httpd_uri_t uri_ota_page   = { .uri = "/update",     .method = HTTP_GET,  .handler = handle_ota_page };
+    httpd_uri_t uri_ota_post   = { .uri = "/update",     .method = HTTP_POST, .handler = handle_ota_post };
 
     httpd_register_uri_handler(s_server, &uri_root);
     httpd_register_uri_handler(s_server, &uri_get_src);
     httpd_register_uri_handler(s_server, &uri_post_src);
     httpd_register_uri_handler(s_server, &uri_get_tasks);
     httpd_register_uri_handler(s_server, &uri_post_tasks);
+    httpd_register_uri_handler(s_server, &uri_ota_page);
+    httpd_register_uri_handler(s_server, &uri_ota_post);
 
     /* mDNS — advertise as http://taskviewer.local/ */
     if (mdns_init() == ESP_OK) {

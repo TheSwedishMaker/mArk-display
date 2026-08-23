@@ -75,6 +75,10 @@ void calendar_sync_completion_cache(void);   /* call after toggling a task's com
 void manual_tasks_save_user(int user_idx, const char *date8, const cal_task_t *tasks, int count);
 int  manual_tasks_load_user(int user_idx, const char *date8, cal_task_t *dest, int max_count);
 
+/* Weekly recurring tasks (NVS-backed, per user, per weekday — Sunday=0..Saturday=6) */
+void weekly_tasks_save_user(int user_idx, int wday, const cal_task_t *tasks, int count);
+int  weekly_tasks_load_user(int user_idx, int wday, cal_task_t *dest, int max_count);
+
 /* Deferred refresh (set flag, picked up by refresh task) */
 void calendar_request_refresh(void);
 bool calendar_refresh_pending(void);

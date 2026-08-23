@@ -69,10 +69,6 @@ static bool s_suppress_completion_save = false;
  * a concurrent user switch from corrupting completion state mid-fetch */
 static int s_fetch_user = 0;
 
-/* ── Local task persistence across refreshes ── */
-static cal_task_t s_local_tasks[MAX_TASKS];
-static int s_local_task_count = 0;
-
 /* ── Manual tasks (NVS-backed, editable from web UI) — per user ── */
 #define MANUAL_TASK_MAX 20
 
@@ -80,14 +76,14 @@ static void manual_ns_for_user(int idx, char *buf, size_t len) {
     snprintf(buf, len, "u%d_tsk", idx);
 }
 
-void manual_tasks_save_user(int user_idx, const char *date8, const cal_task_t *tasks, int count) {
+/* Shared save/load core — `key` is either a date "YYYYMMDD" or a weekday "w0".."w6" */
+static void manual_tasks_save_key(int user_idx, const char *key, const cal_task_t *tasks, int count) {
     char ns[16];
     manual_ns_for_user(user_idx, ns, sizeof(ns));
     nvs_handle_t h;
     if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return;
     if (count > MANUAL_TASK_MAX) count = MANUAL_TASK_MAX;
 
-    /* Serialize as JSON blob stored under the date key (YYYYMMDD) */
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < count; i++) {
         cJSON *obj = cJSON_CreateObject();
@@ -98,30 +94,31 @@ void manual_tasks_save_user(int user_idx, const char *date8, const cal_task_t *t
     char *json = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);
     if (json) {
-        nvs_set_str(h, date8, json);
+        nvs_set_str(h, key, json);
         free(json);
     } else {
-        nvs_erase_key(h, date8);
+        nvs_erase_key(h, key);
     }
     nvs_commit(h);
     nvs_close(h);
-    ESP_LOGI(TAG, "Saved %d manual tasks for user %d on %s", count, user_idx, date8);
+    ESP_LOGI(TAG, "Saved %d manual tasks for user %d key %s", count, user_idx, key);
 }
 
-int manual_tasks_load_user(int user_idx, const char *date8, cal_task_t *dest, int max_count) {
+/* Loads tasks but leaves dest[].id empty — callers stamp their own id format */
+static int manual_tasks_load_key(int user_idx, const char *key, cal_task_t *dest, int max_count) {
     char ns[16];
     manual_ns_for_user(user_idx, ns, sizeof(ns));
     nvs_handle_t h;
     if (nvs_open(ns, NVS_READONLY, &h) != ESP_OK) return 0;
 
     size_t json_len = 0;
-    if (nvs_get_str(h, date8, NULL, &json_len) != ESP_OK || json_len == 0) {
+    if (nvs_get_str(h, key, NULL, &json_len) != ESP_OK || json_len == 0) {
         nvs_close(h);
         return 0;
     }
     char *json = malloc(json_len);
     if (!json) { nvs_close(h); return 0; }
-    nvs_get_str(h, date8, json, &json_len);
+    nvs_get_str(h, key, json, &json_len);
     nvs_close(h);
 
     cJSON *arr = cJSON_Parse(json);
@@ -138,7 +135,7 @@ int manual_tasks_load_user(int user_idx, const char *date8, cal_task_t *dest, in
         dest[count].title[MAX_TITLE_LEN - 1] = '\0';
         strncpy(dest[count].time, cJSON_IsString(jm) ? jm->valuestring : "", sizeof(dest[count].time) - 1);
         dest[count].time[sizeof(dest[count].time) - 1] = '\0';
-        snprintf(dest[count].id, sizeof(dest[count].id), "manual-%d-%d", user_idx, count);
+        dest[count].id[0] = '\0';
         dest[count].completed = false;  /* completion applied later via was_completed() */
         count++;
     }
@@ -146,14 +143,30 @@ int manual_tasks_load_user(int user_idx, const char *date8, cal_task_t *dest, in
     return count;
 }
 
-static void save_local_tasks(void) {
-    s_local_task_count = 0;
-    for (int i = 0; i < cal_task_count && s_local_task_count < MAX_TASKS; i++) {
-        if (strncmp(cal_tasks[i].id, "local-", 6) == 0) {
-            s_local_tasks[s_local_task_count] = cal_tasks[i];
-            s_local_task_count++;
-        }
-    }
+/* Manual and weekly tasks keep an empty id: completion tracking then uses the
+ * content-based "title__time" composite key in save_completion_state() /
+ * was_completed(), which stays stable when the list is edited or reordered
+ * (a positional index id would re-key every task after a deletion). */
+void manual_tasks_save_user(int user_idx, const char *date8, const cal_task_t *tasks, int count) {
+    manual_tasks_save_key(user_idx, date8, tasks, count);
+}
+
+int manual_tasks_load_user(int user_idx, const char *date8, cal_task_t *dest, int max_count) {
+    return manual_tasks_load_key(user_idx, date8, dest, max_count);
+}
+
+void weekly_tasks_save_user(int user_idx, int wday, const cal_task_t *tasks, int count) {
+    if (wday < 0 || wday > 6) return;
+    char key[4];
+    snprintf(key, sizeof(key), "w%d", wday);
+    manual_tasks_save_key(user_idx, key, tasks, count);
+}
+
+int weekly_tasks_load_user(int user_idx, int wday, cal_task_t *dest, int max_count) {
+    if (wday < 0 || wday > 6) return 0;
+    char key[4];
+    snprintf(key, sizeof(key), "w%d", wday);
+    return manual_tasks_load_key(user_idx, key, dest, max_count);
 }
 
 static void save_completion_state(void) {
@@ -748,7 +761,6 @@ bool calendar_fetch(void) {
      * corrupting save_completion_state() / was_completed() mid-fetch */
     s_fetch_user = (active_user >= 0 && active_user < MAX_USERS) ? active_user : 0;
 
-    save_local_tasks();
     if (!s_suppress_completion_save) {
         save_completion_state();
     }
@@ -771,6 +783,29 @@ bool calendar_fetch(void) {
 
     s_stage_count = 0;
 
+    /* Merge NVS-backed manual + weekly tasks first, so user-authored tasks
+     * are never crowded out of the MAX_TASKS cap by a full calendar day.
+     * One buffer serves both loads — it is fully copied into s_stage before
+     * being reused, and a second array would double this frame's stack cost
+     * under the TLS fetches below. */
+    {
+        char date8[9];
+        snprintf(date8, sizeof(date8), "%04d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+        cal_task_t buf[MANUAL_TASK_MAX];
+        int n = manual_tasks_load_user(s_fetch_user, date8, buf, MANUAL_TASK_MAX);
+        for (int i = 0; i < n && s_stage_count < MAX_TASKS; i++) {
+            buf[i].completed = was_completed(&buf[i]);
+            s_stage[s_stage_count++] = buf[i];
+        }
+
+        /* Weekly recurring tasks for this weekday (tm_wday set by mktime above) */
+        n = weekly_tasks_load_user(s_fetch_user, t.tm_wday, buf, MANUAL_TASK_MAX);
+        for (int i = 0; i < n && s_stage_count < MAX_TASKS; i++) {
+            buf[i].completed = was_completed(&buf[i]);
+            s_stage[s_stage_count++] = buf[i];
+        }
+    }
+
     /* Iterate all enabled sources */
     for (int s = 0; s < cal_source_count; s++) {
         if (!cal_sources[s].enabled) continue;
@@ -783,20 +818,8 @@ bool calendar_fetch(void) {
         }
     }
 
-    s_local_task_count = 0;  /* live copies are in NVS — loaded below, no need to re-add */
-
-    /* Merge NVS-backed manual tasks (keyboard + web UI) */
-    {
-        char date8[9];
-        snprintf(date8, sizeof(date8), "%04d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
-        cal_task_t manual[MANUAL_TASK_MAX];
-        int mc = manual_tasks_load_user(s_fetch_user, date8, manual, MANUAL_TASK_MAX);
-        for (int i = 0; i < mc && s_stage_count < MAX_TASKS; i++) {
-            manual[i].completed = was_completed(&manual[i]);
-            s_stage[s_stage_count] = manual[i];
-            s_stage_count++;
-        }
-    }
+    if (s_stage_count >= MAX_TASKS)
+        ESP_LOGW(TAG, "Task list full (%d) — some calendar events were dropped", MAX_TASKS);
 
     /* Sort by time */
     if (s_stage_count > 1) {
@@ -818,25 +841,35 @@ bool calendar_fetch(void) {
 /* ── Apply staged fetch results to live cal_tasks[] — call under LVGL lock ── */
 void calendar_apply_staged(void) {
     int n = s_stage_count < MAX_TASKS ? s_stage_count : MAX_TASKS;
-    memcpy(cal_tasks, s_stage, n * sizeof(cal_task_t));
-    cal_task_count = n;
 
-    /* Cache for instant user-switch restore — tag with today's date so stale
-     * caches from a previous day are rejected on restore.
+    /* Cache for instant user-switch restore — under the user the fetch was
+     * actually FOR (s_fetch_user), not whoever is active now. Tag with
+     * today's date so stale caches from a previous day are rejected.
      * Don't cache the "No events" fallback — a failed fetch shouldn't
      * overwrite a valid cache or spread to other users. */
-    bool is_real_result = !(n == 1 && strcmp(cal_tasks[0].title, "No events") == 0);
-    if (is_real_result && active_user >= 0 && active_user < MAX_USERS) {
-        memcpy(s_task_cache[active_user], cal_tasks, n * sizeof(cal_task_t));
-        s_task_cache_count[active_user] = n;
-        s_task_cache_valid[active_user] = true;
+    bool is_real_result = !(n == 1 && strcmp(s_stage[0].title, "No events") == 0);
+    if (is_real_result && s_fetch_user >= 0 && s_fetch_user < MAX_USERS) {
+        memcpy(s_task_cache[s_fetch_user], s_stage, n * sizeof(cal_task_t));
+        s_task_cache_count[s_fetch_user] = n;
+        s_task_cache_valid[s_fetch_user] = true;
         time_t now = time(NULL);
         now += cal_day_offset * 86400;
         struct tm ct;
         gmtime_r(&now, &ct);
-        snprintf(s_task_cache_date[active_user], sizeof(s_task_cache_date[0]),
+        snprintf(s_task_cache_date[s_fetch_user], sizeof(s_task_cache_date[0]),
                  "%04d%02d%02d", ct.tm_year + 1900, ct.tm_mon + 1, ct.tm_mday);
     }
+
+    /* Only touch the live view if the fetched user is still active — a user
+     * switch mid-fetch must not put another user's tasks on screen */
+    if (s_fetch_user != active_user) {
+        ESP_LOGW(TAG, "Fetch for user %d finished after switch to user %d — cached only",
+                 s_fetch_user, active_user);
+        return;
+    }
+
+    memcpy(cal_tasks, s_stage, n * sizeof(cal_task_t));
+    cal_task_count = n;
 }
 
 /* Restore this user's cached tasks — returns false if no cache or cache is from a previous day */

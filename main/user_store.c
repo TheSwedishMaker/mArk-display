@@ -33,12 +33,17 @@ void user_store_init(void) {
     esp_err_t err = nvs_open(NVS_NS, NVS_READONLY, &h);
 
     if (err != ESP_OK) {
-        /* No namespace yet — first boot. Create default single user. */
-        ESP_LOGI(TAG, "No user data found, creating default user");
-        user_count  = 1;
+        /* No namespace yet — first boot. Seed family members. */
+        ESP_LOGI(TAG, "No user data found, seeding family users");
+        user_count  = 5;
         active_user = 0;
-        strncpy(users[0].name, "Person 1", MAX_USER_NAME_LEN - 1);
-        users[0].name[MAX_USER_NAME_LEN - 1] = '\0';
+        strncpy(users[0].name, "Pierre", MAX_USER_NAME_LEN - 1);
+        strncpy(users[1].name, "Astrid", MAX_USER_NAME_LEN - 1);
+        strncpy(users[2].name, "Ingrid", MAX_USER_NAME_LEN - 1);
+        strncpy(users[3].name, "Julia",  MAX_USER_NAME_LEN - 1);
+        strncpy(users[4].name, "Stina",  MAX_USER_NAME_LEN - 1);
+        for (int i = 0; i < user_count; i++)
+            users[i].name[MAX_USER_NAME_LEN - 1] = '\0';
         user_store_save();
         return;
     }
