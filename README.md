@@ -1,15 +1,18 @@
 # mArk — Family Task Display
 
-mArk is a always-on home display that turns your family's daily calendar into something you can all see, track, and compete over. Each family member gets their own task list pulled live from their calendar. As tasks get marked done, a LED strip fills up. Finish everything and the screen celebrates. Do it again tomorrow and your streak grows. Miss a day and it resets — keeping the competition real.
+mArk is a always-on home display that turns your family's daily calendar into something you can all see, track, and compete over. Each family member gets their own task list pulled live from their calendar. As tasks get marked done, a LED strip fills up. Finish everything and the screen celebrates. Every completed day adds to your monthly highscore — and being away a day never erases what you already earned.
 
 Built on a 10" touchscreen, mArk lives on the kitchen counter or wherever the family gathers. No app to open, no notifications to dismiss. It's just there.
 
-- Up to 6 family members, each with their own tasks and streak counter
+- Up to 6 family members, each with their own tasks and scores
 - Tasks pulled automatically from Google Calendar or Apple Calendar
+- Manual tasks from any phone — plan a week ahead, or make a task repeat weekly
 - LED strip shows how much of the day is done
-- Streak system with levels (Starter → Consistent → Dedicated → Unstoppable → Legend → Titan)
+- Monthly highscore: days completed this month, fresh competition every month
+- Levels (Starter → Consistent → Dedicated → Unstoppable → Legend → Titan) built on your total completed days — they never reset
 - Rotary encoder for scrolling through tasks without touching the screen
-- Web interface for managing calendars from any phone — no computer needed
+- Web interface for managing calendars and tasks from any phone — no computer needed
+- Wireless firmware updates from the browser after the first install
 - Soft power button: short press to turn the display and LEDs on/off
 
 ---
@@ -185,7 +188,7 @@ Once it's running, the display gets its own address on your home network. You'll
 Open any browser on your phone or computer (while on the same WiFi as mArk) and go to:
 
 ```
-http://mark.local/
+http://taskviewer.local/
 ```
 
 If that doesn't work, look at the display's startup screen — it shows the IP address (something like `192.168.1.42`). Use that instead:
@@ -197,6 +200,8 @@ http://192.168.1.42/
 From here you can add calendars for each family member. Paste in the ICS link from Step 3 (Option A) or enter your Google Calendar ID if you're using the API key (Option B).
 
 You can add up to 5 calendar sources per person, mix Google and ICS sources, and toggle individual calendars on or off.
+
+The same page has a task panel where you can add manual tasks for each person — up to a week ahead. Tick **Every ...** on a task to make it repeat weekly on that weekday.
 
 ---
 
@@ -230,11 +235,13 @@ Tasks refresh automatically every 5 minutes. The display also refreshes when you
 
 ---
 
-## Streaks and levels
+## Monthly highscore and levels
 
-Every time someone completes all their tasks for the day, their streak goes up by one. Miss a day and it resets to 1. The streak counter is shown in the left sidebar.
+Every day someone completes all their tasks adds one day to their **monthly count** — the number shown in the sidebar and on the leaderboard. The count starts fresh at the beginning of each month, so every month is a new competition. Missing a day (being away, sick, no tasks) never takes anything away.
 
-| Level | Days needed |
+**Levels** are based on the total number of days you have ever completed, and they never reset:
+
+| Level | Total days completed |
 |---|---|
 | Starter | 0 |
 | Consistent | 5 |
@@ -242,6 +249,20 @@ Every time someone completes all their tasks for the day, their streak goes up b
 | Unstoppable | 30 |
 | Legend | 50 |
 | Titan | 100 |
+
+> **Upgrading from an older version?** The scoring changed: mArk used to count consecutive days and reset to zero after a missed day. Existing streaks are migrated automatically — your old streak becomes the starting value for your total days, so nobody loses their level.
+
+---
+
+## Updating the firmware — no cables needed
+
+After the first USB install, all future updates are wireless:
+
+1. Build the new version: `idf.py build`
+2. Open `http://taskviewer.local/update` on any device on the same WiFi (there is also a link at the bottom of the settings page)
+3. Upload `build/task_viewer.bin` and wait — the display verifies the file, installs it, and restarts by itself
+
+All users, tasks, scores and calendar settings are kept. A failed or interrupted upload leaves the running firmware untouched.
 
 ---
 
